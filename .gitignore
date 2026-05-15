@@ -28,3 +28,6 @@ INPUTS/**/*.webm
 # Local config
 CLAUDE.md
 INPUTS.md
+
+# Claude Code local config
+.claude/
