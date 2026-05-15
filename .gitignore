@@ -1,0 +1,33 @@
+# Environment files — never commit secrets
+.env
+**/.env
+**/*.env
+
+# Runtime output (generated per test run)
+AI-TOOLS/OUTPUTS/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Test reports (large, generated at runtime)
+REPORTS/
+
+# Binary input files — git tracks folder structure via .gitkeep
+# Drop your own images / audio / video locally
+INPUTS/**/*.jpg
+INPUTS/**/*.jpeg
+INPUTS/**/*.png
+INPUTS/**/*.gif
+INPUTS/**/*.webp
+INPUTS/**/*.mp3
+INPUTS/**/*.wav
+INPUTS/**/*.ogg
+INPUTS/**/*.mp4
+INPUTS/**/*.mov
+INPUTS/**/*.webm
+
+# Local config
+CLAUDE.md
+INPUTS.md

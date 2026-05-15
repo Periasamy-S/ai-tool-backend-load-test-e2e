@@ -1,0 +1,612 @@
+import os
+import csv
+import json
+import time
+import random
+import logging
+import requests
+import gevent
+from collections import Counter, defaultdict
+from pathlib import Path
+from datetime import datetime
+from dotenv import load_dotenv
+from gevent import spawn
+from gevent.lock import Semaphore
+from locust import HttpUser, task, between, events
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+_HERE     = Path(__file__).parent
+_ROOT     = _HERE.parents[2]
+_INPUTS   = _ROOT / "INPUTS"
+_OUTPUTS  = _HERE.parents[1] / "OUTPUTS"
+TOOL_NAME = "Image Generation"
+
+load_dotenv(_HERE / ".env")
+load_dotenv(_ROOT / ".env")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+SAVE_OUTPUT      = os.getenv("SAVE_OUTPUT", "false").strip().lower() == "true"
+TASK_TIMEOUT     = int(os.getenv("TASK_TIMEOUT", "300"))
+SLA_THRESHOLD_MS = int(os.getenv("SLA_THRESHOLD_MS", "120000"))
+_FLUSH_EVERY     = int(os.getenv("CSV_FLUSH_EVERY", "10"))
+_RUN_DIR         = None
+
+# ── Observability globals ──────────────────────────────────────────────────────
+TEST_START   = None   # wall time of test_start; set in on_test_start
+_active_jobs = 0      # live count of in-flight jobs
+_jobs_lock   = Semaphore()
+
+# ── Module-level inputs (loaded once at test_start, never again) ───────────────
+_PROMPTS    = []
+_REF_IMAGES = []   # list of (filename: str, content: bytes, mime: str)
+
+RESOLUTIONS = ["16:9", "9:16", "1:1", "3:4", "4:3", "2:3", "3:2"]
+REFERENCE_IMAGE_PROBABILITY = float(os.getenv("REFERENCE_IMAGE_PROB", "0.5"))
+
+# ── CSV ────────────────────────────────────────────────────────────────────────
+_csv_records = []
+_csv_lock    = Semaphore()
+
+_CSV_FIELDS = [
+    "timestamp", "user_id", "generation_id",
+    "prompt", "resolution", "reference_image", "output_count",
+    "status", "issue",
+    "post_ms", "queue_ms", "processing_ms", "total_ms",
+    "failure_category", "sla_breach",
+    "minute", "active_jobs",
+    "output_url",
+]
+
+# ── MIME detection ─────────────────────────────────────────────────────────────
+_MIME = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".png": "image/png",
+}
+
+
+# ── Failure taxonomy ───────────────────────────────────────────────────────────
+def _categorize(issue: str) -> str:
+    if not issue:
+        return ""
+    l = issue.lower()
+    if "timed out" in l or "timeout" in l:
+        return "timeout"
+    if "http" in l:
+        return "http_error"
+    if "connection" in l:
+        return "connection"
+    if "sse" in l:
+        return "sse_closed"
+    if "no generation_id" in l or "invalid json" in l or "invalid output" in l:
+        return "validation"
+    return "backend"
+
+
+# ── Summary / analysis helpers ─────────────────────────────────────────────────
+def _generate_summary(records: list[dict]) -> None:
+    total     = len(records)
+    completed = sum(1 for r in records if r["status"] == "completed")
+    failed    = sum(1 for r in records if r["status"] == "failed")
+    not_done  = sum(1 for r in records if r["status"] == "not_completed")
+    sla_count = sum(1 for r in records if r.get("sla_breach"))
+
+    done = [r for r in records if r["status"] == "completed"]
+    avg_queue = (sum(r.get("queue_ms", 0) for r in done) / len(done)) if done else 0
+    avg_proc  = (sum(r.get("processing_ms", 0) for r in done) / len(done)) if done else 0
+    bottleneck = "QUEUE BOTTLENECK" if avg_queue > avg_proc else "PROCESSING BOTTLENECK"
+    pct_ok     = (completed / total * 100) if total else 0
+    pct_sla    = (sla_count / completed * 100) if completed else 0
+
+    logger.info(
+        f"\n{'═' * 60}\n"
+        f"  PERFORMANCE SUMMARY — {TOOL_NAME}\n"
+        f"{'─' * 60}\n"
+        f"  Total jobs        : {total}\n"
+        f"  Completed         : {completed}  ({pct_ok:.1f}%)\n"
+        f"  Failed            : {failed}\n"
+        f"  Not completed     : {not_done}\n"
+        f"  SLA breaches      : {sla_count}  ({pct_sla:.1f}% of completed)\n"
+        f"{'─' * 60}\n"
+        f"  Avg queue_ms      : {avg_queue:>8.0f} ms\n"
+        f"  Avg processing_ms : {avg_proc:>8.0f} ms\n"
+        f"  Bottleneck        : {bottleneck}\n"
+        f"{'═' * 60}"
+    )
+    if total < 100:
+        logger.warning(
+            "Low sample size (<100 jobs) — "
+            "percentile metrics may be unreliable."
+        )
+
+
+def _aggregate_by_minute(records: list[dict]) -> None:
+    buckets: dict[int, list] = defaultdict(list)
+    for r in records:
+        buckets[r.get("minute", 0)].append(r)
+
+    logger.info(f"\n{'─' * 60}\n  TIME-SERIES (per minute)\n{'─' * 60}")
+    for minute in sorted(buckets):
+        recs  = buckets[minute]
+        done  = [r for r in recs if r["status"] == "completed"]
+        q_avg = (sum(r.get("queue_ms", 0) for r in done) / len(done)) if done else 0
+        p_avg = (sum(r.get("processing_ms", 0) for r in done) / len(done)) if done else 0
+        logger.info(
+            f"  Minute {minute:>3} → "
+            f"jobs={len(recs):>3}  "
+            f"queue={q_avg:>7.0f}ms  "
+            f"processing={p_avg:>7.0f}ms"
+        )
+    logger.info(f"{'─' * 60}")
+
+
+def _failure_breakdown(records: list[dict]) -> None:
+    cats = Counter(
+        r["failure_category"]
+        for r in records
+        if r["status"] in ("failed", "not_completed") and r.get("failure_category")
+    )
+    if not cats:
+        logger.info("No failures to break down.")
+        return
+    logger.info(f"\n{'─' * 60}\n  FAILURE BREAKDOWN\n{'─' * 60}")
+    for cat, count in cats.most_common():
+        logger.info(f"  {cat:<22}: {count}")
+    logger.info(f"{'─' * 60}")
+
+
+# ── Input loaders ──────────────────────────────────────────────────────────────
+def _load_lines(filepath) -> list[str]:
+    p = Path(filepath)
+    return [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines()
+            if ln.strip()] if p.exists() else []
+
+def load_prompts(folder) -> list[str]:
+    lines = [ln[:1499] for ln in _load_lines(Path(folder) / "prompts.txt")]
+    if not lines:
+        raise RuntimeError(f"prompts.txt is missing or empty in: {folder}")
+    random.shuffle(lines)
+    return lines
+
+def load_ref_images(folder) -> list[tuple[str, bytes, str]]:
+    """Preload all reference images into memory as (filename, content, mime)."""
+    result = []
+    p = Path(folder)
+    if not p.exists():
+        return result
+    for f in sorted(p.iterdir()):
+        mime = _MIME.get(f.suffix.lower())
+        if not (f.is_file() and mime):
+            continue
+        try:
+            result.append((f.name, f.read_bytes(), mime))
+            logger.debug(f"Loaded ref image: {f.name} ({len(result[-1][1])} bytes)")
+        except OSError as exc:
+            logger.warning(f"Could not read ref image {f.name}: {exc}")
+    return result
+
+
+# ── Output helpers ─────────────────────────────────────────────────────────────
+def _valid_url(url: str) -> bool:
+    return bool(url) and url.startswith(("http://", "https://"))
+
+def _save_output(gid: str, url: str) -> None:
+    if not SAVE_OUTPUT:
+        return
+    try:
+        filename = url.split("?")[0].rsplit("/", 1)[-1] or f"{gid}.jpg"
+        resp = requests.get(url, timeout=60)
+        resp.raise_for_status()
+        (_RUN_DIR / filename).write_bytes(resp.content)
+        logger.debug(f"Saved output [{gid}]: {filename}")
+    except Exception as exc:
+        logger.warning(f"Output save failed [{gid}]: {exc}")
+
+
+# ── CSV writers ────────────────────────────────────────────────────────────────
+def _write_report(records: list[dict]) -> None:
+    if _RUN_DIR is None:
+        logger.error("_RUN_DIR not set — report.csv not written.")
+        return
+    csv_path = _RUN_DIR / "report.csv"
+    try:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=_CSV_FIELDS)
+            writer.writeheader()
+            writer.writerows(records)
+        logger.info(f"report.csv written — {len(records)} rows: {csv_path}")
+    except OSError as exc:
+        logger.error(f"Failed to write report.csv: {exc}")
+
+def _write_errors(records: list[dict]) -> None:
+    if _RUN_DIR is None:
+        return
+    failures = [r for r in records if r["status"] in ("failed", "not_completed")]
+    if not failures:
+        logger.info("errors.csv — no failures recorded, file not written.")
+        return
+    err_path = _RUN_DIR / "errors.csv"
+    try:
+        with open(err_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=_CSV_FIELDS)
+            writer.writeheader()
+            writer.writerows(failures)
+        logger.warning(f"errors.csv written — {len(failures)} failures: {err_path}")
+    except OSError as exc:
+        logger.error(f"Failed to write errors.csv: {exc}")
+
+
+# ── User ───────────────────────────────────────────────────────────────────────
+class ImageGenerationUser(HttpUser):
+    host      = os.getenv("BASE_URL", "https://test-apigateway.erosuniverse.com")
+    wait_time = between(1, 3)
+    USER_IDS  = [u.strip() for u in os.getenv("USER_IDS", "").split(",") if u.strip()]
+
+    def on_start(self) -> None:
+        self._ready  = False
+        self._sess   = None
+        if not self.USER_IDS:
+            logger.error("USER_IDS not configured — stopping runner.")
+            self.environment.runner.quit()
+            return
+        self._sess  = requests.Session()
+        self._ready = True
+
+    def on_stop(self) -> None:
+        if self._sess:
+            self._sess.close()
+
+    # ── SSE follower ───────────────────────────────────────────────────
+    # timing keys: "first_event", "completed"
+    def _follow_sse(self, parent_id: str, cid: str,
+                    timing: dict) -> tuple[str, str]:
+        url = f"{self.host}/aitools/jobs/{parent_id}/stream/{cid}"
+        logger.info(f"[{cid}] SSE follow start — parent={parent_id}")
+        try:
+            with self._sess.get(
+                url,
+                headers={"Accept": "text/event-stream"},
+                stream=True,
+                timeout=None,
+            ) as resp:
+                if resp.status_code != 200:
+                    return "", f"SSE HTTP {resp.status_code}"
+                for raw in resp.iter_lines():
+                    line = (raw.decode("utf-8") if isinstance(raw, bytes)
+                            else raw).strip()
+                    if not line.startswith("data:"):
+                        continue
+                    try:
+                        event = json.loads(line[5:].strip())
+                    except json.JSONDecodeError:
+                        logger.debug(f"[{cid}] SSE non-JSON line ignored: {line!r}")
+                        continue
+
+                    if "first_event" not in timing:
+                        timing["first_event"] = time.time()
+
+                    status = (event.get("status") or "").lower()
+                    logger.debug(f"[{cid}] SSE event status={status!r}")
+
+                    if status in ("failed", "error"):
+                        return "", (event.get("error_message") or
+                                    event.get("error") or f"status={status}")
+
+                    if status == "completed":
+                        timing["completed"] = time.time()
+                        output_url = next(
+                            (event.get(k) for k in
+                             ("file_url", "output_url", "image_url", "result_url")
+                             if event.get(k)),
+                            "",
+                        )
+                        if not _valid_url(output_url):
+                            return "", (
+                                f"completed event has invalid output URL: "
+                                f"{output_url!r}"
+                            )
+                        return output_url, ""
+
+        except gevent.Timeout:
+            raise
+        except Exception as exc:
+            return "", f"SSE error: {exc}"
+        return "", "SSE stream closed without a completion event"
+
+    # ── Main task ──────────────────────────────────────────────────────
+    @task
+    def fire_generate(self) -> None:
+        if not self._ready or not _PROMPTS:
+            return
+
+        user_id      = random.choice(self.USER_IDS)
+        prompt       = random.choice(_PROMPTS)
+        resolution   = random.choice(RESOLUTIONS)
+        output_count = 1
+        use_ref      = bool(_REF_IMAGES) and random.random() < REFERENCE_IMAGE_PROBABILITY
+        ref_image    = random.choice(_REF_IMAGES) if use_ref else None
+
+        form = [
+            ("user_id",      (None, user_id)),
+            ("prompt",       (None, prompt)),
+            ("resolution",   (None, resolution)),
+            ("output_count", (None, str(output_count))),
+        ]
+        if ref_image:
+            name, content, mime = ref_image
+            form.append(("reference_image", (name, content, mime)))
+
+        # ── Concurrency tracking ───────────────────────────────────────
+        global _active_jobs
+        with _jobs_lock:
+            _active_jobs += 1
+
+        t0            = time.time()
+        minute        = int((t0 - (TEST_START or t0)) / 60)
+        t_post        = t0
+        timing        = {}
+        failed        = False
+        post_failed   = False
+        issue         = ""
+        gid           = ""
+        cid           = ""
+        output_url    = ""
+        post_resp_len = 0
+        record        = None
+
+        try:
+            try:
+                with gevent.Timeout(TASK_TIMEOUT):
+
+                    # ── Step 1: POST /generate ─────────────────────────
+                    try:
+                        post_resp = self._sess.post(
+                            f"{self.host}/aitools/image-generation/v1/generate",
+                            files=form,
+                            timeout=None,
+                        )
+                        t_post        = time.time()
+                        post_resp_len = len(post_resp.content)
+
+                        if post_resp.status_code != 202:
+                            failed = post_failed = True
+                            issue  = f"generate HTTP {post_resp.status_code}"
+                            logger.warning(
+                                f"[user={user_id}] POST failed — {issue} "
+                                f"body={post_resp.text[:200]!r}"
+                            )
+                        else:
+                            try:
+                                body = post_resp.json()
+                                gid  = body.get("generation_id", "")
+                                cids = body.get("child_ids", [])
+                                cid  = cids[0] if cids else gid
+                                if not gid:
+                                    failed = post_failed = True
+                                    issue  = "no generation_id in response"
+                                else:
+                                    logger.info(
+                                        f"[user={user_id}] generate OK — "
+                                        f"gid={gid} cid={cid}"
+                                    )
+                            except Exception as exc:
+                                failed = post_failed = True
+                                issue  = f"invalid JSON from generate: {exc}"
+
+                    except gevent.Timeout:
+                        raise
+                    except Exception as exc:
+                        t_post = time.time()
+                        failed = post_failed = True
+                        issue  = f"generate connection error: {exc}"
+                        logger.warning(f"[user={user_id}] {issue}")
+
+                    # ── Step 2: register CSV record ────────────────────
+                    ref_name = ref_image[0] if ref_image else ""
+                    record = {
+                        "timestamp":        datetime.now().isoformat(),
+                        "user_id":          user_id,
+                        "generation_id":    gid,
+                        "prompt":           prompt,
+                        "resolution":       resolution,
+                        "reference_image":  ref_name,
+                        "output_count":     output_count,
+                        "status":           "submitted",
+                        "output_url":       "",
+                        "issue":            "",
+                        "post_ms":          0,
+                        "queue_ms":         0,
+                        "processing_ms":    0,
+                        "total_ms":         0,
+                        "failure_category": "",
+                        "sla_breach":       False,
+                        "minute":           minute,
+                        "active_jobs":      _active_jobs,
+                    }
+                    with _csv_lock:
+                        _csv_records.append(record)
+
+                    # ── Step 3: follow SSE ─────────────────────────────
+                    if not failed:
+                        output_url, sse_issue = self._follow_sse(gid, cid, timing)
+                        if sse_issue:
+                            failed = True
+                            issue  = sse_issue
+
+            except gevent.Timeout:
+                failed = True
+                issue  = f"task timed out after {TASK_TIMEOUT}s (POST + SSE)"
+                if t_post == t0:
+                    t_post = time.time()
+                logger.warning(f"[user={user_id}] [gid={gid or 'NONE'}] {issue}")
+                if record is None:
+                    ref_name = ref_image[0] if ref_image else ""
+                    record = {
+                        "timestamp":        datetime.now().isoformat(),
+                        "user_id":          user_id,
+                        "generation_id":    gid,
+                        "prompt":           prompt,
+                        "resolution":       resolution,
+                        "reference_image":  ref_name,
+                        "output_count":     output_count,
+                        "status":           "submitted",
+                        "output_url":       "",
+                        "issue":            "",
+                        "post_ms":          0,
+                        "queue_ms":         0,
+                        "processing_ms":    0,
+                        "total_ms":         0,
+                        "failure_category": "",
+                        "sla_breach":       False,
+                        "minute":           minute,
+                        "active_jobs":      _active_jobs,
+                    }
+                    with _csv_lock:
+                        _csv_records.append(record)
+
+            # ── Step 4: compute latency metrics ───────────────────────
+            t_end      = time.time()
+            post_ms    = int((t_post - t0) * 1000)
+            total_ms   = int((t_end - t0) * 1000)
+            queue_ms   = int((timing["first_event"] - t_post) * 1000) \
+                         if "first_event" in timing else 0
+            proc_ms    = int((timing["completed"] - timing["first_event"]) * 1000) \
+                         if ("completed" in timing and "first_event" in timing) else 0
+            sla_breach       = total_ms > SLA_THRESHOLD_MS
+            failure_category = _categorize(issue)
+
+            # ── Step 5: update CSV record ──────────────────────────────
+            with _csv_lock:
+                record["status"]           = "failed" if failed else "completed"
+                record["output_url"]       = output_url
+                record["issue"]            = issue
+                record["post_ms"]          = post_ms
+                record["queue_ms"]         = queue_ms
+                record["processing_ms"]    = proc_ms
+                record["total_ms"]         = total_ms
+                record["failure_category"] = failure_category
+                record["sla_breach"]       = sla_breach
+                cnt      = len(_csv_records)
+                snapshot = list(_csv_records) if cnt % _FLUSH_EVERY == 0 else None
+
+            if snapshot is not None:
+                spawn(_write_report, snapshot)
+
+            # ── Step 6: fire Locust events — one per phase ─────────────
+            self.environment.events.request.fire(
+                request_type="POST",
+                name="image_post",
+                response_time=post_ms,
+                response_length=post_resp_len,
+                exception=Exception(issue) if post_failed else None,
+            )
+            if not post_failed:
+                self.environment.events.request.fire(
+                    request_type="SSE",
+                    name="image_queue",
+                    response_time=queue_ms,
+                    response_length=0,
+                    exception=Exception(issue)
+                              if (failed and "first_event" not in timing) else None,
+                )
+            if "first_event" in timing:
+                self.environment.events.request.fire(
+                    request_type="SSE",
+                    name="image_processing",
+                    response_time=proc_ms,
+                    response_length=0,
+                    exception=Exception(issue)
+                              if (failed and "completed" not in timing) else None,
+                )
+
+            # ── Step 7: outcome logging ────────────────────────────────
+            if failed:
+                logger.warning(
+                    f"[user={user_id}] [gid={gid or 'NONE'}] FAILED "
+                    f"in {total_ms}ms (post={post_ms} queue={queue_ms} proc={proc_ms}) "
+                    f"active={_active_jobs} category={failure_category} — {issue}"
+                )
+            else:
+                logger.info(
+                    f"[user={user_id}] [gid={gid}] COMPLETED "
+                    f"in {total_ms}ms (post={post_ms} queue={queue_ms} proc={proc_ms}) "
+                    f"active={_active_jobs}"
+                    f"{' SLA!' if sla_breach else ''} — {output_url}"
+                )
+                spawn(_save_output, gid, output_url)
+
+        finally:
+            with _jobs_lock:
+                _active_jobs -= 1
+
+
+# ── Events ─────────────────────────────────────────────────────────────────────
+@events.test_start.add_listener
+def on_test_start(environment, **kwargs):
+    global _RUN_DIR, _PROMPTS, _REF_IMAGES, TEST_START
+    TEST_START = time.time()
+    _input_dir = _INPUTS / "AI-TOOLS" / TOOL_NAME
+
+    try:
+        _PROMPTS = load_prompts(_input_dir)
+    except RuntimeError as exc:
+        logger.error(str(exc))
+        environment.runner.quit()
+        return
+
+    _REF_IMAGES = load_ref_images(_input_dir / "reference_images")
+
+    _RUN_DIR = _OUTPUTS / TOOL_NAME / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    _RUN_DIR.mkdir(parents=True, exist_ok=True)
+
+    logger.info(
+        f"\n{'─' * 60}\n"
+        f"  Tool       : {TOOL_NAME}\n"
+        f"  Target     : {os.getenv('BASE_URL', '(BASE_URL not set)')}\n"
+        f"  Prompts    : {len(_PROMPTS)}\n"
+        f"  Ref images : {len(_REF_IMAGES)} (preloaded into memory)\n"
+        f"  Ref prob   : {REFERENCE_IMAGE_PROBABILITY}\n"
+        f"  Task limit : {TASK_TIMEOUT}s\n"
+        f"  SLA target : {SLA_THRESHOLD_MS}ms\n"
+        f"  CSV flush  : every {_FLUSH_EVERY} records\n"
+        f"  Save out   : {SAVE_OUTPUT}\n"
+        f"  Output dir : {_RUN_DIR}\n"
+        f"{'─' * 60}"
+    )
+
+
+@events.test_stop.add_listener
+def on_test_stop(environment, **kwargs):
+    if _RUN_DIR is None:
+        logger.error("Test stopped before _RUN_DIR was set — no CSVs written.")
+        return
+
+    with _csv_lock:
+        for rec in _csv_records:
+            if rec["status"] == "submitted":
+                rec["status"]           = "not_completed"
+                rec["issue"]            = "test stopped before SSE resolved"
+                rec["failure_category"] = _categorize(rec["issue"])
+        records = list(_csv_records)
+
+    total    = len(records)
+    ok       = sum(1 for r in records if r["status"] == "completed")
+    failed   = sum(1 for r in records if r["status"] == "failed")
+    mid_stop = sum(1 for r in records if r["status"] == "not_completed")
+
+    logger.info(
+        f"\n{'─' * 60}\n"
+        f"  Total requests : {total}\n"
+        f"  Completed      : {ok}\n"
+        f"  Failed         : {failed}\n"
+        f"  Not completed  : {mid_stop}\n"
+        f"{'─' * 60}"
+    )
+
+    _write_report(records)
+    _write_errors(records)
+    _generate_summary(records)
+    _aggregate_by_minute(records)
+    _failure_breakdown(records)

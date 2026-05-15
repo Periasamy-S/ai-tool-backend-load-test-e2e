@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p \"D:/Back-end-Client-Scripts/Background Change/INPUTS/images\" \"D:/Back-end-Client-Scripts/Background Change/OUTPUTS\")",
+      "Bash(mkdir -p \"D:/Back-end-Client-Scripts/BW Colorise/INPUTS/images\" \"D:/Back-end-Client-Scripts/BW Colorise/OUTPUTS\")",
+      "Bash(mkdir -p \"D:/Back-end-Client-Scripts/Image Generation/INPUTS/reference_images\" \"D:/Back-end-Client-Scripts/Image Generation/OUTPUTS\")",
+      "Bash(mkdir -p \"D:/Back-end-Client-Scripts/Video Face Swap/INPUTS/template\" \"D:/Back-end-Client-Scripts/Video Face Swap/INPUTS/target\" \"D:/Back-end-Client-Scripts/Video Face Swap/OUTPUTS\")",
+      "Bash(mkdir -p \"D:/Back-end-Client-Scripts/Voice Clone/INPUTS/audio\" \"D:/Back-end-Client-Scripts/Voice Clone/OUTPUTS\")",
+      "Bash(python -c \":*)",
+      "Read(//c/Users/Lenovo/.claude/**)",
+      "Bash(for f:*)",
+      "Bash(do echo:*)",
+      "Bash(python -m py_compile \"$f\")",
+      "Bash(done)",
+      "Bash(for dir:*)",
+      "Read(//d/Back-end-Client-Scripts/$dir/**)",
+      "Bash(python face-swap.py)",
+      "Bash(python bgc.py)",
+      "Bash(python bwc.py)",
+      "Bash(python t2i.py)",
+      "Bash(python vc.py)"
+    ]
+  }
+}

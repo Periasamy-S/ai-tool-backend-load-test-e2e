@@ -1,0 +1,4 @@
+locust
+python-dotenv
+gevent
+requests
