@@ -16,10 +16,10 @@ from locust import HttpUser, task, between, events
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 _HERE     = Path(__file__).parent
-_ROOT     = _HERE.parents[2]
+_ROOT     = _HERE.parents[1]
 _INPUTS   = _ROOT / "INPUTS"
-_OUTPUTS  = _HERE.parents[1] / "OUTPUTS"
-TOOL_NAME = "Video Face Swap"
+_OUTPUTS  = _ROOT / "OUTPUTS"
+TOOL_NAME = "Image Face Swap"
 
 load_dotenv(_HERE / ".env")
 load_dotenv(_ROOT / ".env")
@@ -29,8 +29,8 @@ logger = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 SAVE_OUTPUT      = os.getenv("SAVE_OUTPUT", "false").strip().lower() == "true"
-TASK_TIMEOUT     = int(os.getenv("TASK_TIMEOUT", "600"))
-SLA_THRESHOLD_MS = int(os.getenv("SLA_THRESHOLD_MS", "120000"))
+TASK_TIMEOUT     = int(os.getenv("TASK_TIMEOUT", "300"))
+SLA_THRESHOLD_MS = int(os.getenv("SLA_THRESHOLD_MS", "60000"))
 _FLUSH_EVERY     = int(os.getenv("CSV_FLUSH_EVERY", "10"))
 _RUN_DIR         = None
 
@@ -40,8 +40,8 @@ _active_jobs = 0
 _jobs_lock   = Semaphore()
 
 # ── Module-level inputs (loaded once at test_start) ────────────────────────────
-_VIDEOS  = []
-_TARGETS = []
+_TEMPLATES = []
+_TARGETS   = []
 
 # ── CSV ────────────────────────────────────────────────────────────────────────
 _csv_records = []
@@ -49,13 +49,13 @@ _csv_lock    = Semaphore()
 
 _CSV_FIELDS = [
     "timestamp", "user_id", "generation_id",
-    "template_video", "target_image",
+    "template_image", "target_image",
     "status", "issue",
     "post_ms", "queue_ms", "processing_ms", "total_ms",
     "failure_category", "sla_breach",
     "minute", "active_jobs",
     # diagnostic — CSV only, not fired as Locust events
-    "face_group_detection_ms", "target_detection_ms", "bind_ms", "swap_compute_ms",
+    "template_detection_ms", "target_detection_ms", "swap_compute_ms",
     "output_url",
 ]
 
@@ -154,8 +154,8 @@ def _save_output(gid: str, url: str) -> None:
     if not SAVE_OUTPUT or not url:
         return
     try:
-        filename = url.split("?")[0].rsplit("/", 1)[-1] or f"{gid}.mp4"
-        resp = requests.get(url, timeout=120)
+        filename = url.split("?")[0].rsplit("/", 1)[-1] or f"{gid}.jpg"
+        resp = requests.get(url, timeout=60)
         resp.raise_for_status()
         (_RUN_DIR / filename).write_bytes(resp.content)
     except Exception as exc:
@@ -195,7 +195,7 @@ def _write_errors(records: list[dict]) -> None:
 
 
 # ── User ───────────────────────────────────────────────────────────────────────
-class VideoFaceSwapUser(HttpUser):
+class ImageFaceSwapUser(HttpUser):
     host      = os.getenv("BASE_URL", "")
     wait_time = between(1, 3)
     USER_IDS  = [u.strip() for u in os.getenv("USER_IDS", "").split(",") if u.strip()]
@@ -230,11 +230,10 @@ class VideoFaceSwapUser(HttpUser):
           checkpoint calls (global to the job, not per call).
         - `timing[done_key]` is set when all need keys are collected.
 
-        VFS need keys:
-          "face_groups"    → face_groups_detected dict
-          "target_faces"   → signed_target_face_urls list
-          "ready_for_swap" → status == "ready_for_swap"
-          "completed"      → status == "completed" (also captures output_url)
+        IFS need keys:
+          "template_faces"  → signed_detected_face_urls
+          "target_faces"    → signed_target_face_urls
+          "final_url"       → signed_swap_url or file_url
 
         Returns collected dict on success, None on error event or stream exhaustion.
         """
@@ -251,34 +250,24 @@ class VideoFaceSwapUser(HttpUser):
             if "first_event" not in timing:
                 timing["first_event"] = time.time()
 
-            status = (event.get("status") or "").lower()
-            if status in ("failed", "error"):
+            status = (event.get("status") or "").upper()
+            if status in ("FAILED", "ERROR"):
                 return None
 
-            if "face_groups" in need and not collected.get("face_groups"):
-                groups = event.get("face_groups_detected")
-                if groups:
-                    collected["face_groups"] = groups
+            if "template_faces" in need and not collected.get("template_faces"):
+                urls = event.get("signed_detected_face_urls")
+                if urls:
+                    collected["template_faces"] = urls
 
             if "target_faces" in need and not collected.get("target_faces"):
                 urls = event.get("signed_target_face_urls")
                 if urls:
                     collected["target_faces"] = urls
 
-            if "ready_for_swap" in need and not collected.get("ready_for_swap"):
-                if status == "ready_for_swap":
-                    collected["ready_for_swap"] = True
-
-            if "completed" in need and not collected.get("completed"):
-                if status == "completed":
-                    collected["completed"] = True
-                    out = next(
-                        (event.get(k) for k in
-                         ("file_url", "video_url", "output_url", "result_url")
-                         if event.get(k)),
-                        None,
-                    )
-                    collected["output_url"] = out or ""
+            if "final_url" in need and not collected.get("final_url"):
+                url = event.get("signed_swap_url") or event.get("file_url")
+                if url:
+                    collected["final_url"] = url
 
             if all(k in collected for k in need):
                 if done_key:
@@ -288,14 +277,14 @@ class VideoFaceSwapUser(HttpUser):
         return None  # stream exhausted without satisfying need
 
     # ── Intermediate POST helpers (raw session — invisible to Locust UI) ────────
-    def _post_upload_target_face(self, gid: str, image_path: str) -> tuple[bool, str]:
+    def _post_upload_target(self, gid: str, image_path: str) -> tuple[bool, str]:
         try:
             with open(image_path, "rb") as fh:
                 img_bytes = fh.read()
             resp = self._sess.post(
-                f"{self.host}/aitools/video-face-swap/v1/uploadtargetface/{gid}",
-                files={"file": (os.path.basename(image_path), img_bytes, "image/jpeg")},
-                data={},
+                f"{self.host}/aitools/face-swap/v1/upload-target-files",
+                files={"files": (os.path.basename(image_path), img_bytes, "image/jpeg")},
+                data={"generation_id": gid, "user_id": user_id},
                 timeout=None,
             )
             if resp.status_code != 202:
@@ -306,42 +295,25 @@ class VideoFaceSwapUser(HttpUser):
         except Exception as exc:
             return False, f"upload_target connection error: {exc}"
 
-    def _post_bind_face(
-        self, gid: str, group_id: str, target_url: str
-    ) -> tuple[bool, str]:
+    def _post_generate_swap(self, gid: str, target_face_urls: list) -> tuple[bool, str]:
         try:
             resp = self._sess.post(
-                f"{self.host}/aitools/video-face-swap/v1/uploadnewfaces/{gid}/{group_id}",
-                files={"image_url": (None, target_url)},
+                f"{self.host}/aitools/face-swap/v1/generate",
+                json={"generation_id": gid, "target_file_urls": target_face_urls},
                 timeout=None,
             )
             if resp.status_code != 202:
-                return False, f"face_bind_http_{resp.status_code}"
+                return False, f"generate_http_{resp.status_code}"
             return True, ""
         except gevent.Timeout:
             raise
         except Exception as exc:
-            return False, f"face_bind connection error: {exc}"
-
-    def _post_start_swap(self, gid: str, group_ids: list) -> tuple[bool, str]:
-        try:
-            resp = self._sess.post(
-                f"{self.host}/aitools/video-face-swap/v1/faceswap/{gid}",
-                json={"group_ids": [int(g) for g in group_ids]},
-                timeout=None,
-            )
-            if resp.status_code != 202:
-                return False, f"faceswap_http_{resp.status_code}"
-            return True, ""
-        except gevent.Timeout:
-            raise
-        except Exception as exc:
-            return False, f"faceswap connection error: {exc}"
+            return False, f"generate connection error: {exc}"
 
     # ── Main task — sequential inline, single SSE stream ──────────────────────
     @task
-    def video_face_swap_flow(self) -> None:
-        if not self._ready or not _VIDEOS or not _TARGETS:
+    def face_swap_flow(self) -> None:
+        if not self._ready or not _TEMPLATES or not _TARGETS:
             return
 
         user_id = random.choice(self.USER_IDS)
@@ -351,7 +323,7 @@ class VideoFaceSwapUser(HttpUser):
 
         t0     = time.time()
         minute = int((t0 - (TEST_START or t0)) / 60)
-        tmpl   = random.choice(_VIDEOS)
+        tmpl   = random.choice(_TEMPLATES)
         target = random.choice(_TARGETS)
 
         tmpl_label = os.path.basename(tmpl)
@@ -371,13 +343,13 @@ class VideoFaceSwapUser(HttpUser):
             try:
                 with gevent.Timeout(TASK_TIMEOUT):
 
-                    # ── Step 1: POST uploadvideo ───────────────────────────
+                    # ── Step 1: POST upload-template ───────────────────────
                     try:
                         with open(tmpl, "rb") as fh:
-                            vid_bytes = fh.read()
+                            img_bytes = fh.read()
                         resp = self._sess.post(
-                            f"{self.host}/aitools/video-face-swap/v1/uploadvideo/",
-                            files={"video": (os.path.basename(tmpl), vid_bytes, "video/mp4")},
+                            f"{self.host}/aitools/face-swap/v1/upload-template",
+                            files={"files": (os.path.basename(tmpl), img_bytes, "image/jpeg")},
                             data={"user_id": user_id},
                             timeout=None,
                         )
@@ -385,46 +357,45 @@ class VideoFaceSwapUser(HttpUser):
                         post_resp_len = len(resp.content)
                         if resp.status_code != 202:
                             failed = post_failed = True
-                            issue  = f"upload_video_http_{resp.status_code}"
+                            issue  = f"upload_template_http_{resp.status_code}"
                         else:
                             try:
                                 body = resp.json()
                                 gid  = body.get("generation_id", "")
                                 if not gid:
                                     failed = post_failed = True
-                                    issue  = "upload_video: no generation_id"
+                                    issue  = "upload_template: no generation_id"
                             except Exception as exc:
                                 failed = post_failed = True
-                                issue  = f"upload_video: invalid JSON: {exc}"
+                                issue  = f"upload_template: invalid JSON: {exc}"
                     except gevent.Timeout:
                         raise
                     except Exception as exc:
                         t_post = time.time()
                         failed = post_failed = True
-                        issue  = f"upload_video connection error: {exc}"
+                        issue  = f"upload_template connection error: {exc}"
 
                     # ── Step 2: register CSV record ────────────────────────
                     record = {
-                        "timestamp":               datetime.now().isoformat(),
-                        "user_id":                user_id,
-                        "generation_id":          gid,
-                        "template_video":         tmpl_label,
-                        "target_image":           tgt_label,
-                        "status":                 "submitted",
-                        "output_url":             "",
-                        "issue":                  "",
-                        "post_ms":                0,
-                        "queue_ms":               0,
-                        "processing_ms":          0,
-                        "total_ms":               0,
-                        "failure_category":       "",
-                        "sla_breach":             False,
-                        "minute":                 minute,
-                        "active_jobs":            _active_jobs,
-                        "face_group_detection_ms": 0,
-                        "target_detection_ms":    0,
-                        "bind_ms":                0,
-                        "swap_compute_ms":        0,
+                        "timestamp":              datetime.now().isoformat(),
+                        "user_id":               user_id,
+                        "generation_id":         gid,
+                        "template_image":        tmpl_label,
+                        "target_image":          tgt_label,
+                        "status":                "submitted",
+                        "output_url":            "",
+                        "issue":                 "",
+                        "post_ms":               0,
+                        "queue_ms":              0,
+                        "processing_ms":         0,
+                        "total_ms":              0,
+                        "failure_category":      "",
+                        "sla_breach":            False,
+                        "minute":                minute,
+                        "active_jobs":           _active_jobs,
+                        "template_detection_ms": 0,
+                        "target_detection_ms":   0,
+                        "swap_compute_ms":       0,
                     }
                     with _csv_lock:
                         _csv_records.append(record)
@@ -444,20 +415,18 @@ class VideoFaceSwapUser(HttpUser):
                                 else:
                                     sse_iter = sse_resp.iter_lines()
 
-                                    # Checkpoint A — video face group detection
+                                    # Checkpoint A — template face detection
                                     step1 = self._next_checkpoint(
-                                        sse_iter, {"face_groups"}, timing,
-                                        done_key="face_groups_detected",
+                                        sse_iter, {"template_faces"}, timing,
+                                        done_key="template_detected",
                                     )
                                     if step1 is None:
                                         failed = True
-                                        issue  = "face_group_detection_failed"
+                                        issue  = "template_face_detection_failed"
 
                                     if not failed:
-                                        group_ids = list(step1["face_groups"].keys())
-
-                                        # Intermediate POST — upload target face image
-                                        ok, err = self._post_upload_target_face(gid, target)
+                                        # Intermediate POST — upload target image
+                                        ok, err = self._post_upload_target(gid, target)
                                         if not ok:
                                             failed = True
                                             issue  = err
@@ -474,47 +443,26 @@ class VideoFaceSwapUser(HttpUser):
                                                 issue  = "target_face_detection_failed"
 
                                             if not failed:
-                                                # Intermediate POST — bind target face to group
-                                                ok, err = self._post_bind_face(
-                                                    gid, group_ids[0],
-                                                    step2["target_faces"][0],
+                                                # Intermediate POST — trigger swap
+                                                ok, err = self._post_generate_swap(
+                                                    gid, step2["target_faces"]
                                                 )
                                                 if not ok:
                                                     failed = True
                                                     issue  = err
                                                 else:
-                                                    timing["t_bind_done"] = time.time()
+                                                    timing["t_generate_done"] = time.time()
 
-                                                    # Checkpoint C — ready for swap
+                                                    # Checkpoint C — final output URL
                                                     step3 = self._next_checkpoint(
-                                                        sse_iter, {"ready_for_swap"}, timing,
-                                                        done_key="ready_for_swap",
+                                                        sse_iter, {"final_url"}, timing,
+                                                        done_key="final",
                                                     )
                                                     if step3 is None:
                                                         failed = True
-                                                        issue  = "ready_for_swap_timeout"
-
-                                                    if not failed:
-                                                        # Intermediate POST — start swap
-                                                        ok, err = self._post_start_swap(
-                                                            gid, group_ids
-                                                        )
-                                                        if not ok:
-                                                            failed = True
-                                                            issue  = err
-                                                        else:
-                                                            timing["t_faceswap_done"] = time.time()
-
-                                                            # Checkpoint D — completion
-                                                            step4 = self._next_checkpoint(
-                                                                sse_iter, {"completed"}, timing,
-                                                                done_key="completed",
-                                                            )
-                                                            if step4 is None:
-                                                                failed = True
-                                                                issue  = "completion_timeout"
-                                                            else:
-                                                                output_url = step4.get("output_url", "")
+                                                        issue  = "swap_failed"
+                                                    else:
+                                                        output_url = step3["final_url"]
                         except gevent.Timeout:
                             raise
                         except Exception as exc:
@@ -529,26 +477,25 @@ class VideoFaceSwapUser(HttpUser):
                 logger.warning(f"[user={user_id}] [gid={gid or 'NONE'}] {issue}")
                 if record is None:
                     record = {
-                        "timestamp":               datetime.now().isoformat(),
-                        "user_id":                user_id,
-                        "generation_id":          gid,
-                        "template_video":         tmpl_label,
-                        "target_image":           tgt_label,
-                        "status":                 "submitted",
-                        "output_url":             "",
-                        "issue":                  "",
-                        "post_ms":                0,
-                        "queue_ms":               0,
-                        "processing_ms":          0,
-                        "total_ms":               0,
-                        "failure_category":       "",
-                        "sla_breach":             False,
-                        "minute":                 minute,
-                        "active_jobs":            _active_jobs,
-                        "face_group_detection_ms": 0,
-                        "target_detection_ms":    0,
-                        "bind_ms":                0,
-                        "swap_compute_ms":        0,
+                        "timestamp":              datetime.now().isoformat(),
+                        "user_id":               user_id,
+                        "generation_id":         gid,
+                        "template_image":        tmpl_label,
+                        "target_image":          tgt_label,
+                        "status":                "submitted",
+                        "output_url":            "",
+                        "issue":                 "",
+                        "post_ms":               0,
+                        "queue_ms":              0,
+                        "processing_ms":         0,
+                        "total_ms":              0,
+                        "failure_category":      "",
+                        "sla_breach":            False,
+                        "minute":                minute,
+                        "active_jobs":           _active_jobs,
+                        "template_detection_ms": 0,
+                        "target_detection_ms":   0,
+                        "swap_compute_ms":       0,
                     }
                     with _csv_lock:
                         _csv_records.append(record)
@@ -562,43 +509,38 @@ class VideoFaceSwapUser(HttpUser):
                 if "first_event" in timing else 0
             )
             proc_ms = (
-                int((timing["completed"] - timing["first_event"]) * 1000)
-                if ("completed" in timing and "first_event" in timing) else 0
+                int((timing["final"] - timing["first_event"]) * 1000)
+                if ("final" in timing and "first_event" in timing) else 0
             )
             # Diagnostic: each sub-stage measured independently
-            face_grp_ms = (
-                int((timing["face_groups_detected"] - timing["first_event"]) * 1000)
-                if ("face_groups_detected" in timing and "first_event" in timing) else 0
+            tmpl_det_ms = (
+                int((timing["template_detected"] - timing["first_event"]) * 1000)
+                if ("template_detected" in timing and "first_event" in timing) else 0
             )
             tgt_det_ms = (
                 int((timing["target_detected"] - timing["t_target_uploaded"]) * 1000)
                 if ("target_detected" in timing and "t_target_uploaded" in timing) else 0
             )
-            bind_ms = (
-                int((timing["ready_for_swap"] - timing["t_bind_done"]) * 1000)
-                if ("ready_for_swap" in timing and "t_bind_done" in timing) else 0
-            )
             swap_ms = (
-                int((timing["completed"] - timing["t_faceswap_done"]) * 1000)
-                if ("completed" in timing and "t_faceswap_done" in timing) else 0
+                int((timing["final"] - timing["t_generate_done"]) * 1000)
+                if ("final" in timing and "t_generate_done" in timing) else 0
             )
             sla_breach       = total_ms > SLA_THRESHOLD_MS
             failure_category = _categorize(issue)
 
             # ── Step 5: update CSV record ──────────────────────────────────
             with _csv_lock:
-                record["status"]                 = "failed" if failed else "completed"
-                record["output_url"]             = output_url
-                record["issue"]                  = issue
-                record["post_ms"]                = post_ms
-                record["queue_ms"]               = queue_ms
-                record["processing_ms"]          = proc_ms
-                record["total_ms"]               = total_ms
-                record["failure_category"]       = failure_category
-                record["sla_breach"]             = sla_breach
-                record["face_group_detection_ms"] = face_grp_ms
-                record["target_detection_ms"]    = tgt_det_ms
-                record["bind_ms"]                = bind_ms
+                record["status"]                = "failed" if failed else "completed"
+                record["output_url"]            = output_url
+                record["issue"]                 = issue
+                record["post_ms"]               = post_ms
+                record["queue_ms"]              = queue_ms
+                record["processing_ms"]         = proc_ms
+                record["total_ms"]              = total_ms
+                record["failure_category"]      = failure_category
+                record["sla_breach"]            = sla_breach
+                record["template_detection_ms"] = tmpl_det_ms
+                record["target_detection_ms"]   = tgt_det_ms
                 record["swap_compute_ms"]        = swap_ms
                 cnt      = len(_csv_records)
                 snapshot = list(_csv_records) if cnt % _FLUSH_EVERY == 0 else None
@@ -609,7 +551,7 @@ class VideoFaceSwapUser(HttpUser):
             # ── Step 6: fire Locust events — stage-gated, 3 only ──────────
             self.environment.events.request.fire(
                 request_type="POST",
-                name="vfs_post",
+                name="ifs_post",
                 response_time=post_ms,
                 response_length=post_resp_len,
                 exception=Exception(issue) if post_failed else None,
@@ -617,7 +559,7 @@ class VideoFaceSwapUser(HttpUser):
             if not post_failed:
                 self.environment.events.request.fire(
                     request_type="SSE",
-                    name="vfs_queue",
+                    name="ifs_queue",
                     response_time=queue_ms,
                     response_length=0,
                     exception=Exception(issue)
@@ -626,11 +568,11 @@ class VideoFaceSwapUser(HttpUser):
             if "first_event" in timing:
                 self.environment.events.request.fire(
                     request_type="SSE",
-                    name="vfs_processing",
+                    name="ifs_processing",
                     response_time=proc_ms,
                     response_length=0,
                     exception=Exception(issue)
-                              if (failed and "completed" not in timing) else None,
+                              if (failed and "final" not in timing) else None,
                 )
 
             # ── Step 7: outcome logging ────────────────────────────────────
@@ -657,18 +599,19 @@ class VideoFaceSwapUser(HttpUser):
 # ── Events ─────────────────────────────────────────────────────────────────────
 @events.test_start.add_listener
 def on_test_start(environment, **kwargs):
-    global _RUN_DIR, _VIDEOS, _TARGETS, TEST_START
+    global _RUN_DIR, _TEMPLATES, _TARGETS, TEST_START
     TEST_START = time.time()
 
-    _VIDEOS  = _find_files(_INPUTS / "AI-TOOLS/Face Swap/TemplateVideos", ".mp4")
-    _TARGETS = _find_files(_INPUTS / "AI-TOOLS/Face Swap/TargetImages",
-                           ".jpg", ".jpeg", ".png")
-    random.shuffle(_VIDEOS)
+    _TEMPLATES = _find_files(_INPUTS / "Face Swap/TemplateImages",
+                             ".jpg", ".jpeg", ".png")
+    _TARGETS   = _find_files(_INPUTS / "Face Swap/TargetImages",
+                             ".jpg", ".jpeg", ".png")
+    random.shuffle(_TEMPLATES)
     random.shuffle(_TARGETS)
 
-    if not _VIDEOS or not _TARGETS:
+    if not _TEMPLATES or not _TARGETS:
         logger.error(
-            f"Missing inputs — videos={len(_VIDEOS)} targets={len(_TARGETS)} — stopping runner."
+            f"Missing inputs — templates={len(_TEMPLATES)} targets={len(_TARGETS)} — stopping runner."
         )
         environment.runner.quit()
         return
@@ -680,7 +623,7 @@ def on_test_start(environment, **kwargs):
         f"\n{'─' * 60}\n"
         f"  Tool         : {TOOL_NAME}\n"
         f"  Target       : {os.getenv('BASE_URL', '(BASE_URL not set)')}\n"
-        f"  Videos       : {len(_VIDEOS)} files\n"
+        f"  Templates    : {len(_TEMPLATES)} files\n"
         f"  Targets      : {len(_TARGETS)} files\n"
         f"  Task limit   : {TASK_TIMEOUT}s\n"
         f"  SLA target   : {SLA_THRESHOLD_MS}ms\n"

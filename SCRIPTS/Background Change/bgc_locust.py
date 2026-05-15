@@ -16,10 +16,10 @@ from locust import HttpUser, task, between, events
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 _HERE     = Path(__file__).parent
-_ROOT     = _HERE.parents[2]
+_ROOT     = _HERE.parents[1]
 _INPUTS   = _ROOT / "INPUTS"
-_OUTPUTS  = _HERE.parents[1] / "OUTPUTS"
-TOOL_NAME = "Image Generation"
+_OUTPUTS  = _ROOT / "OUTPUTS"
+TOOL_NAME = "Background Change"
 
 load_dotenv(_HERE / ".env")
 load_dotenv(_ROOT / ".env")
@@ -35,16 +35,18 @@ _FLUSH_EVERY     = int(os.getenv("CSV_FLUSH_EVERY", "10"))
 _RUN_DIR         = None
 
 # ── Observability globals ──────────────────────────────────────────────────────
-TEST_START   = None   # wall time of test_start; set in on_test_start
-_active_jobs = 0      # live count of in-flight jobs
+TEST_START   = None
+_active_jobs = 0
 _jobs_lock   = Semaphore()
 
-# ── Module-level inputs (loaded once at test_start, never again) ───────────────
-_PROMPTS    = []
-_REF_IMAGES = []   # list of (filename: str, content: bytes, mime: str)
+# ── Module-level inputs (loaded once at test_start, zero I/O during test) ──────
+_IMAGES  = []
+_PROMPTS = []
 
-RESOLUTIONS = ["16:9", "9:16", "1:1", "3:4", "4:3", "2:3", "3:2"]
-REFERENCE_IMAGE_PROBABILITY = float(os.getenv("REFERENCE_IMAGE_PROB", "0.5"))
+_MIME = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".png": "image/png",
+}
 
 # ── CSV ────────────────────────────────────────────────────────────────────────
 _csv_records = []
@@ -52,19 +54,13 @@ _csv_lock    = Semaphore()
 
 _CSV_FIELDS = [
     "timestamp", "user_id", "generation_id",
-    "prompt", "resolution", "reference_image", "output_count",
+    "image_file", "prompt",
     "status", "issue",
     "post_ms", "queue_ms", "processing_ms", "total_ms",
     "failure_category", "sla_breach",
     "minute", "active_jobs",
     "output_url",
 ]
-
-# ── MIME detection ─────────────────────────────────────────────────────────────
-_MIME = {
-    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-    ".png": "image/png",
-}
 
 
 # ── Failure taxonomy ───────────────────────────────────────────────────────────
@@ -93,7 +89,7 @@ def _generate_summary(records: list[dict]) -> None:
     not_done  = sum(1 for r in records if r["status"] == "not_completed")
     sla_count = sum(1 for r in records if r.get("sla_breach"))
 
-    done = [r for r in records if r["status"] == "completed"]
+    done      = [r for r in records if r["status"] == "completed"]
     avg_queue = (sum(r.get("queue_ms", 0) for r in done) / len(done)) if done else 0
     avg_proc  = (sum(r.get("processing_ms", 0) for r in done) / len(done)) if done else 0
     bottleneck = "QUEUE BOTTLENECK" if avg_queue > avg_proc else "PROCESSING BOTTLENECK"
@@ -163,15 +159,7 @@ def _load_lines(filepath) -> list[str]:
     return [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines()
             if ln.strip()] if p.exists() else []
 
-def load_prompts(folder) -> list[str]:
-    lines = [ln[:1499] for ln in _load_lines(Path(folder) / "prompts.txt")]
-    if not lines:
-        raise RuntimeError(f"prompts.txt is missing or empty in: {folder}")
-    random.shuffle(lines)
-    return lines
-
-def load_ref_images(folder) -> list[tuple[str, bytes, str]]:
-    """Preload all reference images into memory as (filename, content, mime)."""
+def load_images(folder) -> list[tuple[str, bytes, str]]:
     result = []
     p = Path(folder)
     if not p.exists():
@@ -182,11 +170,9 @@ def load_ref_images(folder) -> list[tuple[str, bytes, str]]:
             continue
         try:
             result.append((f.name, f.read_bytes(), mime))
-            logger.debug(f"Loaded ref image: {f.name} ({len(result[-1][1])} bytes)")
         except OSError as exc:
-            logger.warning(f"Could not read ref image {f.name}: {exc}")
+            logger.warning(f"Could not read image {f.name}: {exc}")
     return result
-
 
 # ── Output helpers ─────────────────────────────────────────────────────────────
 def _valid_url(url: str) -> bool:
@@ -200,7 +186,6 @@ def _save_output(gid: str, url: str) -> None:
         resp = requests.get(url, timeout=60)
         resp.raise_for_status()
         (_RUN_DIR / filename).write_bytes(resp.content)
-        logger.debug(f"Saved output [{gid}]: {filename}")
     except Exception as exc:
         logger.warning(f"Output save failed [{gid}]: {exc}")
 
@@ -225,7 +210,7 @@ def _write_errors(records: list[dict]) -> None:
         return
     failures = [r for r in records if r["status"] in ("failed", "not_completed")]
     if not failures:
-        logger.info("errors.csv — no failures recorded, file not written.")
+        logger.info("errors.csv — no failures, file not written.")
         return
     err_path = _RUN_DIR / "errors.csv"
     try:
@@ -239,14 +224,14 @@ def _write_errors(records: list[dict]) -> None:
 
 
 # ── User ───────────────────────────────────────────────────────────────────────
-class ImageGenerationUser(HttpUser):
+class BackgroundChangeUser(HttpUser):
     host      = os.getenv("BASE_URL", "https://test-apigateway.erosuniverse.com")
     wait_time = between(1, 3)
     USER_IDS  = [u.strip() for u in os.getenv("USER_IDS", "").split(",") if u.strip()]
 
     def on_start(self) -> None:
-        self._ready  = False
-        self._sess   = None
+        self._ready = False
+        self._sess  = None
         if not self.USER_IDS:
             logger.error("USER_IDS not configured — stopping runner.")
             self.environment.runner.quit()
@@ -260,10 +245,9 @@ class ImageGenerationUser(HttpUser):
 
     # ── SSE follower ───────────────────────────────────────────────────
     # timing keys: "first_event", "completed"
-    def _follow_sse(self, parent_id: str, cid: str,
-                    timing: dict) -> tuple[str, str]:
-        url = f"{self.host}/aitools/jobs/{parent_id}/stream/{cid}"
-        logger.info(f"[{cid}] SSE follow start — parent={parent_id}")
+    def _follow_sse(self, gid: str, timing: dict) -> tuple[str, str]:
+        url = f"{self.host}/aitools/jobs/{gid}/stream"
+        logger.info(f"[{gid}] SSE follow start")
         try:
             with self._sess.get(
                 url,
@@ -281,14 +265,14 @@ class ImageGenerationUser(HttpUser):
                     try:
                         event = json.loads(line[5:].strip())
                     except json.JSONDecodeError:
-                        logger.debug(f"[{cid}] SSE non-JSON line ignored: {line!r}")
+                        logger.debug(f"[{gid}] SSE non-JSON ignored: {line!r}")
                         continue
 
                     if "first_event" not in timing:
                         timing["first_event"] = time.time()
 
                     status = (event.get("status") or "").lower()
-                    logger.debug(f"[{cid}] SSE event status={status!r}")
+                    logger.debug(f"[{gid}] SSE status={status!r}")
 
                     if status in ("failed", "error"):
                         return "", (event.get("error_message") or
@@ -298,15 +282,13 @@ class ImageGenerationUser(HttpUser):
                         timing["completed"] = time.time()
                         output_url = next(
                             (event.get(k) for k in
-                             ("file_url", "output_url", "image_url", "result_url")
+                             ("file_url", "signed_result_url", "output_url",
+                              "image_url", "result_url")
                              if event.get(k)),
                             "",
                         )
                         if not _valid_url(output_url):
-                            return "", (
-                                f"completed event has invalid output URL: "
-                                f"{output_url!r}"
-                            )
+                            return "", f"completed event has invalid output URL: {output_url!r}"
                         return output_url, ""
 
         except gevent.Timeout:
@@ -318,25 +300,19 @@ class ImageGenerationUser(HttpUser):
     # ── Main task ──────────────────────────────────────────────────────
     @task
     def fire_generate(self) -> None:
-        if not self._ready or not _PROMPTS:
+        if not self._ready or not _IMAGES:
             return
 
-        user_id      = random.choice(self.USER_IDS)
-        prompt       = random.choice(_PROMPTS)
-        resolution   = random.choice(RESOLUTIONS)
-        output_count = 1
-        use_ref      = bool(_REF_IMAGES) and random.random() < REFERENCE_IMAGE_PROBABILITY
-        ref_image    = random.choice(_REF_IMAGES) if use_ref else None
+        user_id = random.choice(self.USER_IDS)
+        name, content, mime = random.choice(_IMAGES)
+        prompt = random.choice(_PROMPTS) if _PROMPTS else ""
 
         form = [
-            ("user_id",      (None, user_id)),
-            ("prompt",       (None, prompt)),
-            ("resolution",   (None, resolution)),
-            ("output_count", (None, str(output_count))),
+            ("image",   (name, content, mime)),
+            ("prompt",  (None, prompt)),
+            ("user_id", (None, user_id)),
         ]
-        if ref_image:
-            name, content, mime = ref_image
-            form.append(("reference_image", (name, content, mime)))
+        input_label = name
 
         # ── Concurrency tracking ───────────────────────────────────────
         global _active_jobs
@@ -351,7 +327,6 @@ class ImageGenerationUser(HttpUser):
         post_failed   = False
         issue         = ""
         gid           = ""
-        cid           = ""
         output_url    = ""
         post_resp_len = 0
         record        = None
@@ -363,13 +338,12 @@ class ImageGenerationUser(HttpUser):
                     # ── Step 1: POST /generate ─────────────────────────
                     try:
                         post_resp = self._sess.post(
-                            f"{self.host}/aitools/image-generation/v1/generate",
+                            f"{self.host}/aitools/background-change/v1/generate",
                             files=form,
                             timeout=None,
                         )
                         t_post        = time.time()
                         post_resp_len = len(post_resp.content)
-
                         if post_resp.status_code != 202:
                             failed = post_failed = True
                             issue  = f"generate HTTP {post_resp.status_code}"
@@ -381,20 +355,16 @@ class ImageGenerationUser(HttpUser):
                             try:
                                 body = post_resp.json()
                                 gid  = body.get("generation_id", "")
-                                cids = body.get("child_ids", [])
-                                cid  = cids[0] if cids else gid
                                 if not gid:
                                     failed = post_failed = True
                                     issue  = "no generation_id in response"
                                 else:
                                     logger.info(
-                                        f"[user={user_id}] generate OK — "
-                                        f"gid={gid} cid={cid}"
+                                        f"[user={user_id}] generate OK — gid={gid}"
                                     )
                             except Exception as exc:
                                 failed = post_failed = True
                                 issue  = f"invalid JSON from generate: {exc}"
-
                     except gevent.Timeout:
                         raise
                     except Exception as exc:
@@ -404,15 +374,12 @@ class ImageGenerationUser(HttpUser):
                         logger.warning(f"[user={user_id}] {issue}")
 
                     # ── Step 2: register CSV record ────────────────────
-                    ref_name = ref_image[0] if ref_image else ""
                     record = {
                         "timestamp":        datetime.now().isoformat(),
                         "user_id":          user_id,
                         "generation_id":    gid,
+                        "image_file":       input_label,
                         "prompt":           prompt,
-                        "resolution":       resolution,
-                        "reference_image":  ref_name,
-                        "output_count":     output_count,
                         "status":           "submitted",
                         "output_url":       "",
                         "issue":            "",
@@ -430,27 +397,24 @@ class ImageGenerationUser(HttpUser):
 
                     # ── Step 3: follow SSE ─────────────────────────────
                     if not failed:
-                        output_url, sse_issue = self._follow_sse(gid, cid, timing)
+                        output_url, sse_issue = self._follow_sse(gid, timing)
                         if sse_issue:
                             failed = True
                             issue  = sse_issue
 
             except gevent.Timeout:
                 failed = True
-                issue  = f"task timed out after {TASK_TIMEOUT}s (POST + SSE)"
+                issue  = f"task timed out after {TASK_TIMEOUT}s"
                 if t_post == t0:
                     t_post = time.time()
                 logger.warning(f"[user={user_id}] [gid={gid or 'NONE'}] {issue}")
                 if record is None:
-                    ref_name = ref_image[0] if ref_image else ""
                     record = {
                         "timestamp":        datetime.now().isoformat(),
                         "user_id":          user_id,
                         "generation_id":    gid,
+                        "image_file":       input_label,
                         "prompt":           prompt,
-                        "resolution":       resolution,
-                        "reference_image":  ref_name,
-                        "output_count":     output_count,
                         "status":           "submitted",
                         "output_url":       "",
                         "issue":            "",
@@ -494,10 +458,10 @@ class ImageGenerationUser(HttpUser):
             if snapshot is not None:
                 spawn(_write_report, snapshot)
 
-            # ── Step 6: fire Locust events — one per phase ─────────────
+            # ── Step 6: fire Locust events ─────────────────────────────
             self.environment.events.request.fire(
                 request_type="POST",
-                name="image_post",
+                name="bgc_post",
                 response_time=post_ms,
                 response_length=post_resp_len,
                 exception=Exception(issue) if post_failed else None,
@@ -505,7 +469,7 @@ class ImageGenerationUser(HttpUser):
             if not post_failed:
                 self.environment.events.request.fire(
                     request_type="SSE",
-                    name="image_queue",
+                    name="bgc_queue",
                     response_time=queue_ms,
                     response_length=0,
                     exception=Exception(issue)
@@ -514,7 +478,7 @@ class ImageGenerationUser(HttpUser):
             if "first_event" in timing:
                 self.environment.events.request.fire(
                     request_type="SSE",
-                    name="image_processing",
+                    name="bgc_processing",
                     response_time=proc_ms,
                     response_length=0,
                     exception=Exception(issue)
@@ -545,33 +509,29 @@ class ImageGenerationUser(HttpUser):
 # ── Events ─────────────────────────────────────────────────────────────────────
 @events.test_start.add_listener
 def on_test_start(environment, **kwargs):
-    global _RUN_DIR, _PROMPTS, _REF_IMAGES, TEST_START
+    global _RUN_DIR, _IMAGES, _PROMPTS, TEST_START
     TEST_START = time.time()
-    _input_dir = _INPUTS / "AI-TOOLS" / TOOL_NAME
+    _input_dir = _INPUTS / TOOL_NAME
+    _IMAGES    = load_images(_input_dir / "input_images")
+    _PROMPTS   = [ln[:1499] for ln in _load_lines(_input_dir / "prompts.txt")]
+    random.shuffle(_PROMPTS)
 
-    try:
-        _PROMPTS = load_prompts(_input_dir)
-    except RuntimeError as exc:
-        logger.error(str(exc))
+    if not _IMAGES:
+        logger.error("No images found — stopping runner.")
         environment.runner.quit()
         return
 
-    _REF_IMAGES = load_ref_images(_input_dir / "reference_images")
-
     _RUN_DIR = _OUTPUTS / TOOL_NAME / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     _RUN_DIR.mkdir(parents=True, exist_ok=True)
-
     logger.info(
         f"\n{'─' * 60}\n"
         f"  Tool       : {TOOL_NAME}\n"
         f"  Target     : {os.getenv('BASE_URL', '(BASE_URL not set)')}\n"
+        f"  Images     : {len(_IMAGES)} (preloaded)\n"
         f"  Prompts    : {len(_PROMPTS)}\n"
-        f"  Ref images : {len(_REF_IMAGES)} (preloaded into memory)\n"
-        f"  Ref prob   : {REFERENCE_IMAGE_PROBABILITY}\n"
         f"  Task limit : {TASK_TIMEOUT}s\n"
         f"  SLA target : {SLA_THRESHOLD_MS}ms\n"
         f"  CSV flush  : every {_FLUSH_EVERY} records\n"
-        f"  Save out   : {SAVE_OUTPUT}\n"
         f"  Output dir : {_RUN_DIR}\n"
         f"{'─' * 60}"
     )
@@ -582,7 +542,6 @@ def on_test_stop(environment, **kwargs):
     if _RUN_DIR is None:
         logger.error("Test stopped before _RUN_DIR was set — no CSVs written.")
         return
-
     with _csv_lock:
         for rec in _csv_records:
             if rec["status"] == "submitted":
@@ -591,20 +550,15 @@ def on_test_stop(environment, **kwargs):
                 rec["failure_category"] = _categorize(rec["issue"])
         records = list(_csv_records)
 
-    total    = len(records)
     ok       = sum(1 for r in records if r["status"] == "completed")
     failed   = sum(1 for r in records if r["status"] == "failed")
     mid_stop = sum(1 for r in records if r["status"] == "not_completed")
-
     logger.info(
         f"\n{'─' * 60}\n"
-        f"  Total requests : {total}\n"
-        f"  Completed      : {ok}\n"
-        f"  Failed         : {failed}\n"
-        f"  Not completed  : {mid_stop}\n"
+        f"  Total : {len(records)}  Completed : {ok}  "
+        f"Failed : {failed}  Not completed : {mid_stop}\n"
         f"{'─' * 60}"
     )
-
     _write_report(records)
     _write_errors(records)
     _generate_summary(records)

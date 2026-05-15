@@ -16,10 +16,10 @@ from locust import HttpUser, task, between, events
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 _HERE     = Path(__file__).parent
-_ROOT     = _HERE.parents[2]
+_ROOT     = _HERE.parents[1]
 _INPUTS   = _ROOT / "INPUTS"
-_OUTPUTS  = _HERE.parents[1] / "OUTPUTS"
-TOOL_NAME = "BW Colorise"
+_OUTPUTS  = _ROOT / "OUTPUTS"
+TOOL_NAME = "Voice Remix"
 
 load_dotenv(_HERE / ".env")
 load_dotenv(_ROOT / ".env")
@@ -38,18 +38,13 @@ _RUN_DIR         = None
 TEST_START   = None
 _active_jobs = 0
 _jobs_lock   = Semaphore()
- 
+
 # ── Module-level inputs (loaded once at test_start, zero I/O during test) ──────
-_IMAGES  = []
-_PROMPTS = []
+_AUDIO_FILES = []
+_SINGERS     = []
 
-PRESETS = ["Natural", "Vibrant", "Warm", "Cool", "Classic",
-           "Cinematic", "Retro", "Soft", "Dramatic"]
-MODES   = ["Black&White", "Original", "Auto"]
-
-_MIME = {
-    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-    ".png": "image/png",
+_AUDIO_MIME = {
+    ".mp3": "audio/mpeg", ".wav": "audio/wav",
 }
 
 # ── CSV ────────────────────────────────────────────────────────────────────────
@@ -58,7 +53,8 @@ _csv_lock    = Semaphore()
 
 _CSV_FIELDS = [
     "timestamp", "user_id", "generation_id",
-    "image_file", "prompt", "mode", "preset",
+    "audio_file", "singer",
+    "expression_intensity", "vibrato_depth", "noise_reduction",
     "status", "issue",
     "post_ms", "queue_ms", "processing_ms", "total_ms",
     "failure_category", "sla_breach",
@@ -163,19 +159,19 @@ def _load_lines(filepath) -> list[str]:
     return [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines()
             if ln.strip()] if p.exists() else []
 
-def load_images(folder) -> list[tuple[str, bytes, str]]:
+def load_audio_files(folder) -> list[tuple[str, bytes, str]]:
     result = []
     p = Path(folder)
     if not p.exists():
         return result
     for f in sorted(p.iterdir()):
-        mime = _MIME.get(f.suffix.lower())
+        mime = _AUDIO_MIME.get(f.suffix.lower())
         if not (f.is_file() and mime):
             continue
         try:
             result.append((f.name, f.read_bytes(), mime))
         except OSError as exc:
-            logger.warning(f"Could not read image {f.name}: {exc}")
+            logger.warning(f"Could not read audio {f.name}: {exc}")
     return result
 
 
@@ -187,7 +183,7 @@ def _save_output(gid: str, url: str) -> None:
     if not SAVE_OUTPUT:
         return
     try:
-        filename = url.split("?")[0].rsplit("/", 1)[-1] or f"{gid}.jpg"
+        filename = url.split("?")[0].rsplit("/", 1)[-1] or f"{gid}.mp3"
         resp = requests.get(url, timeout=60)
         resp.raise_for_status()
         (_RUN_DIR / filename).write_bytes(resp.content)
@@ -229,10 +225,17 @@ def _write_errors(records: list[dict]) -> None:
 
 
 # ── User ───────────────────────────────────────────────────────────────────────
-class ColorizeUser(HttpUser):
+class VoiceRemixUser(HttpUser):
     host      = os.getenv("BASE_URL", "https://test-apigateway.erosuniverse.com")
     wait_time = between(1, 3)
     USER_IDS  = [u.strip() for u in os.getenv("USER_IDS", "").split(",") if u.strip()]
+
+    EXPRESSION_INTENSITY_MIN = int(os.getenv("EXPRESSION_INTENSITY_MIN", "0"))
+    EXPRESSION_INTENSITY_MAX = int(os.getenv("EXPRESSION_INTENSITY_MAX", "100"))
+    VIBRATO_DEPTH_MIN        = int(os.getenv("VIBRATO_DEPTH_MIN",        "0"))
+    VIBRATO_DEPTH_MAX        = int(os.getenv("VIBRATO_DEPTH_MAX",        "100"))
+    NOISE_REDUCTION_MIN      = int(os.getenv("NOISE_REDUCTION_MIN",      "0"))
+    NOISE_REDUCTION_MAX      = int(os.getenv("NOISE_REDUCTION_MAX",      "100"))
 
     def on_start(self) -> None:
         self._ready = False
@@ -287,7 +290,7 @@ class ColorizeUser(HttpUser):
                         timing["completed"] = time.time()
                         output_url = next(
                             (event.get(k) for k in
-                             ("file_url", "output_url", "image_url", "result_url")
+                             ("file_url", "audio_url", "output_url", "result_url")
                              if event.get(k)),
                             "",
                         )
@@ -304,21 +307,29 @@ class ColorizeUser(HttpUser):
     # ── Main task ──────────────────────────────────────────────────────
     @task
     def fire_generate(self) -> None:
-        if not self._ready or not _IMAGES:
+        if not self._ready or not _AUDIO_FILES or not _SINGERS:
             return
 
         user_id = random.choice(self.USER_IDS)
-        img_name, img_content, img_mime = random.choice(_IMAGES)
-        prompt = random.choice(_PROMPTS)
-        mode   = random.choice(MODES)
-        preset = random.choice(PRESETS)
+        audio_name, audio_content, audio_mime = random.choice(_AUDIO_FILES)
+        singer               = random.choice(_SINGERS)
+        expression_intensity = random.randint(self.EXPRESSION_INTENSITY_MIN,
+                                              self.EXPRESSION_INTENSITY_MAX)
+        vibrato_depth        = random.randint(self.VIBRATO_DEPTH_MIN,
+                                              self.VIBRATO_DEPTH_MAX)
+        noise_reduction      = random.randint(self.NOISE_REDUCTION_MIN,
+                                              self.NOISE_REDUCTION_MAX)
 
         form = [
-            ("image",   (img_name, img_content, img_mime)),
-            ("user_id", (None, user_id)),
-            ("prompt",  (None, prompt)),
-            ("mode",    (None, mode)),
-            ("preset",  (None, preset)),
+            ("audio_file",           (audio_name, audio_content, audio_mime)),
+            ("user_id",              (None, user_id)),
+            ("consent",              (None, "true")),
+            ("singer",               (None, singer)),
+            ("expression_intensity", (None, str(expression_intensity))),
+            ("vibrato_depth",        (None, str(vibrato_depth))),
+            ("pitch_correction",     (None, random.choice(["true", "false"]))),
+            ("formant_preservation", (None, random.choice(["true", "false"]))),
+            ("noise_reduction",      (None, str(noise_reduction))),
         ]
 
         # ── Concurrency tracking ───────────────────────────────────────
@@ -342,10 +353,10 @@ class ColorizeUser(HttpUser):
             try:
                 with gevent.Timeout(TASK_TIMEOUT):
 
-                    # ── Step 1: POST /generate ─────────────────────────
+                    # ── Step 1: POST /convert ──────────────────────────
                     try:
                         post_resp = self._sess.post(
-                            f"{self.host}/aitools/colorize/v1/generate",
+                            f"{self.host}/aitools/voice-remix/v1/convert",
                             files=form,
                             timeout=None,
                         )
@@ -382,24 +393,25 @@ class ColorizeUser(HttpUser):
 
                     # ── Step 2: register CSV record ────────────────────
                     record = {
-                        "timestamp":        datetime.now().isoformat(),
-                        "user_id":          user_id,
-                        "generation_id":    gid,
-                        "image_file":       img_name,
-                        "prompt":           prompt,
-                        "mode":             mode,
-                        "preset":           preset,
-                        "status":           "submitted",
-                        "output_url":       "",
-                        "issue":            "",
-                        "post_ms":          0,
-                        "queue_ms":         0,
-                        "processing_ms":    0,
-                        "total_ms":         0,
-                        "failure_category": "",
-                        "sla_breach":       False,
-                        "minute":           minute,
-                        "active_jobs":      _active_jobs,
+                        "timestamp":            datetime.now().isoformat(),
+                        "user_id":              user_id,
+                        "generation_id":        gid,
+                        "audio_file":           audio_name,
+                        "singer":               singer,
+                        "expression_intensity": expression_intensity,
+                        "vibrato_depth":        vibrato_depth,
+                        "noise_reduction":      noise_reduction,
+                        "status":               "submitted",
+                        "output_url":           "",
+                        "issue":                "",
+                        "post_ms":              0,
+                        "queue_ms":             0,
+                        "processing_ms":        0,
+                        "total_ms":             0,
+                        "failure_category":     "",
+                        "sla_breach":           False,
+                        "minute":               minute,
+                        "active_jobs":          _active_jobs,
                     }
                     with _csv_lock:
                         _csv_records.append(record)
@@ -419,24 +431,25 @@ class ColorizeUser(HttpUser):
                 logger.warning(f"[user={user_id}] [gid={gid or 'NONE'}] {issue}")
                 if record is None:
                     record = {
-                        "timestamp":        datetime.now().isoformat(),
-                        "user_id":          user_id,
-                        "generation_id":    gid,
-                        "image_file":       img_name,
-                        "prompt":           prompt,
-                        "mode":             mode,
-                        "preset":           preset,
-                        "status":           "submitted",
-                        "output_url":       "",
-                        "issue":            "",
-                        "post_ms":          0,
-                        "queue_ms":         0,
-                        "processing_ms":    0,
-                        "total_ms":         0,
-                        "failure_category": "",
-                        "sla_breach":       False,
-                        "minute":           minute,
-                        "active_jobs":      _active_jobs,
+                        "timestamp":            datetime.now().isoformat(),
+                        "user_id":              user_id,
+                        "generation_id":        gid,
+                        "audio_file":           audio_name,
+                        "singer":               singer,
+                        "expression_intensity": expression_intensity,
+                        "vibrato_depth":        vibrato_depth,
+                        "noise_reduction":      noise_reduction,
+                        "status":               "submitted",
+                        "output_url":           "",
+                        "issue":                "",
+                        "post_ms":              0,
+                        "queue_ms":             0,
+                        "processing_ms":        0,
+                        "total_ms":             0,
+                        "failure_category":     "",
+                        "sla_breach":           False,
+                        "minute":               minute,
+                        "active_jobs":          _active_jobs,
                     }
                     with _csv_lock:
                         _csv_records.append(record)
@@ -472,7 +485,7 @@ class ColorizeUser(HttpUser):
             # ── Step 6: fire Locust events ─────────────────────────────
             self.environment.events.request.fire(
                 request_type="POST",
-                name="bwc_post",
+                name="rvc_post",
                 response_time=post_ms,
                 response_length=post_resp_len,
                 exception=Exception(issue) if post_failed else None,
@@ -480,7 +493,7 @@ class ColorizeUser(HttpUser):
             if not post_failed:
                 self.environment.events.request.fire(
                     request_type="SSE",
-                    name="bwc_queue",
+                    name="rvc_queue",
                     response_time=queue_ms,
                     response_length=0,
                     exception=Exception(issue)
@@ -489,7 +502,7 @@ class ColorizeUser(HttpUser):
             if "first_event" in timing:
                 self.environment.events.request.fire(
                     request_type="SSE",
-                    name="bwc_processing&completion",
+                    name="rvc_processing",
                     response_time=proc_ms,
                     response_length=0,
                     exception=Exception(issue)
@@ -520,19 +533,21 @@ class ColorizeUser(HttpUser):
 # ── Events ─────────────────────────────────────────────────────────────────────
 @events.test_start.add_listener
 def on_test_start(environment, **kwargs):
-    global _RUN_DIR, _IMAGES, _PROMPTS, TEST_START
-    TEST_START = time.time()
-    _input_dir = _INPUTS / "AI-TOOLS" / TOOL_NAME
-    _IMAGES    = load_images(_input_dir / "Images")
-    _PROMPTS   = [ln[:1499] for ln in _load_lines(_input_dir / "prompts.txt")]
-    random.shuffle(_PROMPTS)
+    global _RUN_DIR, _AUDIO_FILES, _SINGERS, TEST_START
+    TEST_START   = time.time()
+    _input_dir   = _INPUTS / TOOL_NAME
+    _AUDIO_FILES = load_audio_files(_input_dir)
+    _SINGERS     = _load_lines(_input_dir / "singers.txt")
+    if not _SINGERS:
+        _SINGERS = [s.strip() for s in os.getenv("SINGERS", "Mohammad rafi").split(",") if s.strip()]
+    random.shuffle(_SINGERS)
 
-    if not _IMAGES:
-        logger.error("No images found — stopping runner.")
+    if not _AUDIO_FILES:
+        logger.error("No audio files found — stopping runner.")
         environment.runner.quit()
         return
-    if not _PROMPTS:
-        logger.error("prompts.txt missing or empty — stopping runner.")
+    if not _SINGERS:
+        logger.error("No singers configured — stopping runner.")
         environment.runner.quit()
         return
 
@@ -540,16 +555,14 @@ def on_test_start(environment, **kwargs):
     _RUN_DIR.mkdir(parents=True, exist_ok=True)
     logger.info(
         f"\n{'─' * 60}\n"
-        f"  Tool       : {TOOL_NAME}\n"
-        f"  Target     : {os.getenv('BASE_URL', '(BASE_URL not set)')}\n"
-        f"  Images     : {len(_IMAGES)} (preloaded)\n"
-        f"  Prompts    : {len(_PROMPTS)}\n"
-        f"  Modes      : {MODES}\n"
-        f"  Presets    : {len(PRESETS)}\n"
-        f"  Task limit : {TASK_TIMEOUT}s\n"
-        f"  SLA target : {SLA_THRESHOLD_MS}ms\n"
-        f"  CSV flush  : every {_FLUSH_EVERY} records\n"
-        f"  Output dir : {_RUN_DIR}\n"
+        f"  Tool        : {TOOL_NAME}\n"
+        f"  Target      : {os.getenv('BASE_URL', '(BASE_URL not set)')}\n"
+        f"  Audio files : {len(_AUDIO_FILES)} (preloaded)\n"
+        f"  Singers     : {len(_SINGERS)} — {_SINGERS}\n"
+        f"  Task limit  : {TASK_TIMEOUT}s\n"
+        f"  SLA target  : {SLA_THRESHOLD_MS}ms\n"
+        f"  CSV flush   : every {_FLUSH_EVERY} records\n"
+        f"  Output dir  : {_RUN_DIR}\n"
         f"{'─' * 60}"
     )
 

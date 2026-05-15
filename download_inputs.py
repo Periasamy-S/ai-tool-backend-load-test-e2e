@@ -16,7 +16,7 @@ from pathlib import Path
 from gtts import gTTS
 
 FFMPEG = "C:/Users/Lenovo/ffmpeg_extracted/ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe"
-BASE   = Path("D:/Load-Test-Scripts/INPUTS/AI-TOOLS")
+BASE   = Path(__file__).parent / "INPUTS"
 S      = requests.Session()
 S.headers.update({"User-Agent": "Mozilla/5.0"})
 

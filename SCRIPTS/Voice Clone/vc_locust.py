@@ -16,9 +16,9 @@ from locust import HttpUser, task, between, events
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 _HERE     = Path(__file__).parent
-_ROOT     = _HERE.parents[2]
+_ROOT     = _HERE.parents[1]
 _INPUTS   = _ROOT / "INPUTS"
-_OUTPUTS  = _HERE.parents[1] / "OUTPUTS"
+_OUTPUTS  = _ROOT / "OUTPUTS"
 TOOL_NAME = "Voice Clone"
 
 load_dotenv(_HERE / ".env")
@@ -668,7 +668,7 @@ class VoiceCloneUser(HttpUser):
 def on_test_start(environment, **kwargs):
     global _RUN_DIR, _AUDIO_FILES, _INPUT_TEXTS, TEST_START
     TEST_START   = time.time()
-    _input_dir   = _INPUTS / "AI-TOOLS" / TOOL_NAME
+    _input_dir   = _INPUTS / TOOL_NAME
     _AUDIO_FILES = load_audio_files(_input_dir / "input_audio")
     _INPUT_TEXTS = _load_lines(_input_dir / "input_text.txt") or _FALLBACK_TEXTS
     random.shuffle(_INPUT_TEXTS)

@@ -3,16 +3,13 @@
 **/.env
 **/*.env
 
-# Runtime output (generated per test run)
-AI-TOOLS/OUTPUTS/
+# Runtime outputs and reports (generated per test run)
+OUTPUTS/
 
 # Python cache
 __pycache__/
 **/__pycache__/
 *.pyc
-
-# Test reports (large, generated at runtime)
-REPORTS/
 
 # Binary input files — git tracks folder structure via .gitkeep
 # Drop your own images / audio / video locally

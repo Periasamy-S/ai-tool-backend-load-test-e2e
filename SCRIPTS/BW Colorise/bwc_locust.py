@@ -16,10 +16,10 @@ from locust import HttpUser, task, between, events
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 _HERE     = Path(__file__).parent
-_ROOT     = _HERE.parents[2]
+_ROOT     = _HERE.parents[1]
 _INPUTS   = _ROOT / "INPUTS"
-_OUTPUTS  = _HERE.parents[1] / "OUTPUTS"
-TOOL_NAME = "Background Change"
+_OUTPUTS  = _ROOT / "OUTPUTS"
+TOOL_NAME = "BW Colorise"
 
 load_dotenv(_HERE / ".env")
 load_dotenv(_ROOT / ".env")
@@ -38,10 +38,14 @@ _RUN_DIR         = None
 TEST_START   = None
 _active_jobs = 0
 _jobs_lock   = Semaphore()
-
+ 
 # ── Module-level inputs (loaded once at test_start, zero I/O during test) ──────
 _IMAGES  = []
 _PROMPTS = []
+
+PRESETS = ["Natural", "Vibrant", "Warm", "Cool", "Classic",
+           "Cinematic", "Retro", "Soft", "Dramatic"]
+MODES   = ["Black&White", "Original", "Auto"]
 
 _MIME = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -54,7 +58,7 @@ _csv_lock    = Semaphore()
 
 _CSV_FIELDS = [
     "timestamp", "user_id", "generation_id",
-    "image_file", "prompt",
+    "image_file", "prompt", "mode", "preset",
     "status", "issue",
     "post_ms", "queue_ms", "processing_ms", "total_ms",
     "failure_category", "sla_breach",
@@ -174,6 +178,7 @@ def load_images(folder) -> list[tuple[str, bytes, str]]:
             logger.warning(f"Could not read image {f.name}: {exc}")
     return result
 
+
 # ── Output helpers ─────────────────────────────────────────────────────────────
 def _valid_url(url: str) -> bool:
     return bool(url) and url.startswith(("http://", "https://"))
@@ -224,7 +229,7 @@ def _write_errors(records: list[dict]) -> None:
 
 
 # ── User ───────────────────────────────────────────────────────────────────────
-class BackgroundChangeUser(HttpUser):
+class ColorizeUser(HttpUser):
     host      = os.getenv("BASE_URL", "https://test-apigateway.erosuniverse.com")
     wait_time = between(1, 3)
     USER_IDS  = [u.strip() for u in os.getenv("USER_IDS", "").split(",") if u.strip()]
@@ -282,8 +287,7 @@ class BackgroundChangeUser(HttpUser):
                         timing["completed"] = time.time()
                         output_url = next(
                             (event.get(k) for k in
-                             ("file_url", "signed_result_url", "output_url",
-                              "image_url", "result_url")
+                             ("file_url", "output_url", "image_url", "result_url")
                              if event.get(k)),
                             "",
                         )
@@ -304,15 +308,18 @@ class BackgroundChangeUser(HttpUser):
             return
 
         user_id = random.choice(self.USER_IDS)
-        name, content, mime = random.choice(_IMAGES)
-        prompt = random.choice(_PROMPTS) if _PROMPTS else ""
+        img_name, img_content, img_mime = random.choice(_IMAGES)
+        prompt = random.choice(_PROMPTS)
+        mode   = random.choice(MODES)
+        preset = random.choice(PRESETS)
 
         form = [
-            ("image",   (name, content, mime)),
-            ("prompt",  (None, prompt)),
+            ("image",   (img_name, img_content, img_mime)),
             ("user_id", (None, user_id)),
+            ("prompt",  (None, prompt)),
+            ("mode",    (None, mode)),
+            ("preset",  (None, preset)),
         ]
-        input_label = name
 
         # ── Concurrency tracking ───────────────────────────────────────
         global _active_jobs
@@ -338,7 +345,7 @@ class BackgroundChangeUser(HttpUser):
                     # ── Step 1: POST /generate ─────────────────────────
                     try:
                         post_resp = self._sess.post(
-                            f"{self.host}/aitools/background-change/v1/generate",
+                            f"{self.host}/aitools/colorize/v1/generate",
                             files=form,
                             timeout=None,
                         )
@@ -378,8 +385,10 @@ class BackgroundChangeUser(HttpUser):
                         "timestamp":        datetime.now().isoformat(),
                         "user_id":          user_id,
                         "generation_id":    gid,
-                        "image_file":       input_label,
+                        "image_file":       img_name,
                         "prompt":           prompt,
+                        "mode":             mode,
+                        "preset":           preset,
                         "status":           "submitted",
                         "output_url":       "",
                         "issue":            "",
@@ -413,8 +422,10 @@ class BackgroundChangeUser(HttpUser):
                         "timestamp":        datetime.now().isoformat(),
                         "user_id":          user_id,
                         "generation_id":    gid,
-                        "image_file":       input_label,
+                        "image_file":       img_name,
                         "prompt":           prompt,
+                        "mode":             mode,
+                        "preset":           preset,
                         "status":           "submitted",
                         "output_url":       "",
                         "issue":            "",
@@ -461,7 +472,7 @@ class BackgroundChangeUser(HttpUser):
             # ── Step 6: fire Locust events ─────────────────────────────
             self.environment.events.request.fire(
                 request_type="POST",
-                name="bgc_post",
+                name="bwc_post",
                 response_time=post_ms,
                 response_length=post_resp_len,
                 exception=Exception(issue) if post_failed else None,
@@ -469,7 +480,7 @@ class BackgroundChangeUser(HttpUser):
             if not post_failed:
                 self.environment.events.request.fire(
                     request_type="SSE",
-                    name="bgc_queue",
+                    name="bwc_queue",
                     response_time=queue_ms,
                     response_length=0,
                     exception=Exception(issue)
@@ -478,7 +489,7 @@ class BackgroundChangeUser(HttpUser):
             if "first_event" in timing:
                 self.environment.events.request.fire(
                     request_type="SSE",
-                    name="bgc_processing",
+                    name="bwc_processing&completion",
                     response_time=proc_ms,
                     response_length=0,
                     exception=Exception(issue)
@@ -511,13 +522,17 @@ class BackgroundChangeUser(HttpUser):
 def on_test_start(environment, **kwargs):
     global _RUN_DIR, _IMAGES, _PROMPTS, TEST_START
     TEST_START = time.time()
-    _input_dir = _INPUTS / "AI-TOOLS" / TOOL_NAME
-    _IMAGES    = load_images(_input_dir / "input_images")
+    _input_dir = _INPUTS / TOOL_NAME
+    _IMAGES    = load_images(_input_dir / "Images")
     _PROMPTS   = [ln[:1499] for ln in _load_lines(_input_dir / "prompts.txt")]
     random.shuffle(_PROMPTS)
 
     if not _IMAGES:
         logger.error("No images found — stopping runner.")
+        environment.runner.quit()
+        return
+    if not _PROMPTS:
+        logger.error("prompts.txt missing or empty — stopping runner.")
         environment.runner.quit()
         return
 
@@ -529,6 +544,8 @@ def on_test_start(environment, **kwargs):
         f"  Target     : {os.getenv('BASE_URL', '(BASE_URL not set)')}\n"
         f"  Images     : {len(_IMAGES)} (preloaded)\n"
         f"  Prompts    : {len(_PROMPTS)}\n"
+        f"  Modes      : {MODES}\n"
+        f"  Presets    : {len(PRESETS)}\n"
         f"  Task limit : {TASK_TIMEOUT}s\n"
         f"  SLA target : {SLA_THRESHOLD_MS}ms\n"
         f"  CSV flush  : every {_FLUSH_EVERY} records\n"
