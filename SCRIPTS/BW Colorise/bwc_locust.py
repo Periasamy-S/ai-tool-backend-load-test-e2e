@@ -45,7 +45,7 @@ _PROMPTS = []
 
 PRESETS = ["Natural", "Vibrant", "Warm", "Cool", "Classic",
            "Cinematic", "Retro", "Soft", "Dramatic"]
-MODES   = ["Black&White", "Original", "Auto"]
+MODES   = ["Black&White", "Original", "Colorize"]
 
 _MIME = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
