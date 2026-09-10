@@ -1,4 +1,5 @@
 import os
+import sys
 import csv
 import json
 import time
@@ -14,12 +15,17 @@ from gevent import spawn
 from gevent.lock import Semaphore
 from locust import HttpUser, task, between, events
 
+# ── TestOps centralized storage ─────────────────────────────────────────────────
+sys.path.insert(0, os.getenv("TESTOPS_SHARED", os.path.join(os.path.expanduser("~"), ".testops", "Shared")))
+from path_manager import init_run, get_locust_directory
+
 # ── Paths ──────────────────────────────────────────────────────────────────────
 _HERE     = Path(__file__).parent
 _ROOT     = _HERE.parents[1]
 _INPUTS   = _ROOT / "INPUTS"
-_OUTPUTS  = _ROOT / "OUTPUTS"
 TOOL_NAME = "Video Face Swap"
+
+init_run(project="Load-Test/AI-Tools", tool=TOOL_NAME)
 
 load_dotenv(_HERE / ".env")
 load_dotenv(_ROOT / ".env")
@@ -48,7 +54,7 @@ _csv_records = []
 _csv_lock    = Semaphore()
 
 _CSV_FIELDS = [
-    "timestamp", "user_id", "generation_id",
+    "timestamp", "completed_at", "user_id", "subscription_tier", "generation_id",
     "template_video", "target_image",
     "status", "issue",
     "post_ms", "queue_ms", "processing_ms", "total_ms",
@@ -194,17 +200,144 @@ def _write_errors(records: list[dict]) -> None:
         logger.error(f"Failed to write errors.csv: {exc}")
 
 
+# ── Queue / priority-hierarchy audit ────────────────────────────────────────────
+# Dispatch priority order: pro is served first, basic last.
+_TIER_PRIORITY = ["pro", "plus", "lite", "basic"]
+
+def _write_queue_audit(records: list[dict]) -> None:
+    """
+    Proves the backend's priority queue (pro > plus > lite > basic) is actually
+    honoured under load: a per-tier summary (does pro queue faster than basic?)
+    and a wall-clock-minute x tier timeline (did a burst of concurrent requests
+    resolve in priority order?).
+    """
+    if _RUN_DIR is None:
+        return
+
+    by_tier: dict[str, list] = defaultdict(list)
+    for r in records:
+        by_tier[r.get("subscription_tier", "")].append(r)
+
+    # ── Per-tier summary ─────────────────────────────────────────────────
+    summary_fields = [
+        "subscription_tier", "total_requests", "completed", "failed", "not_completed",
+        "completion_rate_pct", "avg_queue_ms", "min_queue_ms", "max_queue_ms",
+        "avg_processing_ms", "avg_total_ms",
+    ]
+    summary_rows  = []
+    tier_avg_queue = {}
+    for tier in _TIER_PRIORITY:
+        recs = by_tier.get(tier, [])
+        if not recs:
+            continue
+        completed = [r for r in recs if r["status"] == "completed"]
+        failed    = sum(1 for r in recs if r["status"] == "failed")
+        not_done  = sum(1 for r in recs if r["status"] == "not_completed")
+        q_vals    = [r.get("queue_ms", 0) for r in completed]
+        avg_q     = (sum(q_vals) / len(q_vals)) if q_vals else 0
+        tier_avg_queue[tier] = avg_q
+        summary_rows.append({
+            "subscription_tier":   tier,
+            "total_requests":      len(recs),
+            "completed":           len(completed),
+            "failed":              failed,
+            "not_completed":       not_done,
+            "completion_rate_pct": round(len(completed) / len(recs) * 100, 1),
+            "avg_queue_ms":        round(avg_q, 1),
+            "min_queue_ms":        min(q_vals) if q_vals else 0,
+            "max_queue_ms":        max(q_vals) if q_vals else 0,
+            "avg_processing_ms":   round(sum(r.get("processing_ms", 0) for r in completed) / len(completed), 1) if completed else 0,
+            "avg_total_ms":        round(sum(r.get("total_ms", 0) for r in completed) / len(completed), 1) if completed else 0,
+        })
+
+    summary_path = _RUN_DIR / "queue_audit_summary.csv"
+    try:
+        with open(summary_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=summary_fields)
+            writer.writeheader()
+            writer.writerows(summary_rows)
+        logger.info(f"queue_audit_summary.csv written — {len(summary_rows)} tiers: {summary_path}")
+    except OSError as exc:
+        logger.error(f"Failed to write queue_audit_summary.csv: {exc}")
+
+    # ── Priority-hierarchy check (logged, not written) ─────────────────────
+    ordered = [t for t in _TIER_PRIORITY if t in tier_avg_queue]
+    if len(ordered) > 1:
+        hierarchy_str = " > ".join(f"{t}={tier_avg_queue[t]:.0f}ms" for t in ordered)
+        violations = [
+            (ordered[i], ordered[i + 1])
+            for i in range(len(ordered) - 1)
+            if tier_avg_queue[ordered[i]] > tier_avg_queue[ordered[i + 1]]
+        ]
+        if violations:
+            logger.warning(
+                f"QUEUE PRIORITY CHECK — hierarchy NOT respected (avg queue_ms): "
+                f"{hierarchy_str}  violations={violations}"
+            )
+        else:
+            logger.info(f"QUEUE PRIORITY CHECK — hierarchy respected (avg queue_ms): {hierarchy_str}")
+
+    # ── Timeline: wall-clock minute x tier ──────────────────────────────────
+    timeline_fields = [
+        "window", "subscription_tier", "request_count", "completed",
+        "failed", "not_completed", "avg_queue_ms", "avg_total_ms",
+    ]
+    buckets: dict[tuple, list] = defaultdict(list)
+    for r in records:
+        ts     = r.get("timestamp", "")
+        window = ts[11:16] if len(ts) >= 16 else "unknown"  # HH:MM
+        buckets[(window, r.get("subscription_tier", ""))].append(r)
+
+    timeline_rows = []
+    for (window, tier), recs in sorted(buckets.items()):
+        completed = [r for r in recs if r["status"] == "completed"]
+        failed    = sum(1 for r in recs if r["status"] == "failed")
+        not_done  = sum(1 for r in recs if r["status"] == "not_completed")
+        q_vals    = [r.get("queue_ms", 0) for r in completed]
+        t_vals    = [r.get("total_ms", 0) for r in completed]
+        timeline_rows.append({
+            "window":             window,
+            "subscription_tier":  tier,
+            "request_count":      len(recs),
+            "completed":          len(completed),
+            "failed":             failed,
+            "not_completed":      not_done,
+            "avg_queue_ms":       round(sum(q_vals) / len(q_vals), 1) if q_vals else 0,
+            "avg_total_ms":       round(sum(t_vals) / len(t_vals), 1) if t_vals else 0,
+        })
+
+    timeline_path = _RUN_DIR / "queue_audit_timeline.csv"
+    try:
+        with open(timeline_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=timeline_fields)
+            writer.writeheader()
+            writer.writerows(timeline_rows)
+        logger.info(f"queue_audit_timeline.csv written — {len(timeline_rows)} rows: {timeline_path}")
+    except OSError as exc:
+        logger.error(f"Failed to write queue_audit_timeline.csv: {exc}")
+
+
 # ── User ───────────────────────────────────────────────────────────────────────
 class VideoFaceSwapUser(HttpUser):
     host      = os.getenv("BASE_URL", "")
     wait_time = between(1, 3)
-    USER_IDS  = [u.strip() for u in os.getenv("USER_IDS", "").split(",") if u.strip()]
+    # ── Subscription-tier user ids (priority queue: pro > plus > lite > basic) ──
+    USER_TIERS = [
+        (uid.strip(), tier)
+        for tier, uid in (
+            ("basic", os.getenv("USER_ID_BASIC", "")),
+            ("lite",  os.getenv("USER_ID_LITE", "")),
+            ("plus",  os.getenv("USER_ID_PLUS", "")),
+            ("pro",   os.getenv("USER_ID_PRO", "")),
+        )
+        if uid.strip()
+    ]
 
     def on_start(self) -> None:
         self._ready = False
         self._sess  = None
-        if not self.USER_IDS:
-            logger.error("USER_IDS not configured — stopping runner.")
+        if not self.USER_TIERS:
+            logger.error("No USER_ID_* configured (USER_ID_BASIC/USER_ID_LITE/USER_ID_PLUS/USER_ID_PRO) — stopping runner.")
             self.environment.runner.quit()
             return
         self._sess  = requests.Session()
@@ -344,7 +477,7 @@ class VideoFaceSwapUser(HttpUser):
         if not self._ready or not _VIDEOS or not _TARGETS:
             return
 
-        user_id = random.choice(self.USER_IDS)
+        user_id, subscription_tier = random.choice(self.USER_TIERS)
         global _active_jobs
         with _jobs_lock:
             _active_jobs += 1
@@ -406,7 +539,9 @@ class VideoFaceSwapUser(HttpUser):
                     # ── Step 2: register CSV record ────────────────────────
                     record = {
                         "timestamp":               datetime.now().isoformat(),
+                        "completed_at":            "",
                         "user_id":                user_id,
+                        "subscription_tier":      subscription_tier,
                         "generation_id":          gid,
                         "template_video":         tmpl_label,
                         "target_image":           tgt_label,
@@ -526,11 +661,13 @@ class VideoFaceSwapUser(HttpUser):
                 issue  = f"task timed out after {TASK_TIMEOUT}s"
                 if t_post == t0:
                     t_post = time.time()
-                logger.warning(f"[user={user_id}] [gid={gid or 'NONE'}] {issue}")
+                logger.warning(f"[user={user_id}/{subscription_tier}] [gid={gid or 'NONE'}] {issue}")
                 if record is None:
                     record = {
                         "timestamp":               datetime.now().isoformat(),
+                        "completed_at":            "",
                         "user_id":                user_id,
+                        "subscription_tier":      subscription_tier,
                         "generation_id":          gid,
                         "template_video":         tmpl_label,
                         "target_image":           tgt_label,
@@ -588,6 +725,7 @@ class VideoFaceSwapUser(HttpUser):
             # ── Step 5: update CSV record ──────────────────────────────────
             with _csv_lock:
                 record["status"]                 = "failed" if failed else "completed"
+                record["completed_at"]           = datetime.fromtimestamp(t_end).isoformat()
                 record["output_url"]             = output_url
                 record["issue"]                  = issue
                 record["post_ms"]                = post_ms
@@ -636,13 +774,13 @@ class VideoFaceSwapUser(HttpUser):
             # ── Step 7: outcome logging ────────────────────────────────────
             if failed:
                 logger.warning(
-                    f"[user={user_id}] [gid={gid or 'NONE'}] FAILED "
+                    f"[user={user_id}/{subscription_tier}] [gid={gid or 'NONE'}] FAILED "
                     f"post={post_ms}ms queue={queue_ms}ms proc={proc_ms}ms "
                     f"active={_active_jobs} category={failure_category} — {issue}"
                 )
             else:
                 logger.info(
-                    f"[user={user_id}] [gid={gid}] COMPLETED "
+                    f"[user={user_id}/{subscription_tier}] [gid={gid}] COMPLETED "
                     f"post={post_ms}ms queue={queue_ms}ms proc={proc_ms}ms "
                     f"active={_active_jobs}"
                     f"{' SLA!' if sla_breach else ''}"
@@ -673,7 +811,7 @@ def on_test_start(environment, **kwargs):
         environment.runner.quit()
         return
 
-    _RUN_DIR = _OUTPUTS / TOOL_NAME / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    _RUN_DIR = get_locust_directory()
     _RUN_DIR.mkdir(parents=True, exist_ok=True)
 
     logger.info(
@@ -721,6 +859,7 @@ def on_test_stop(environment, **kwargs):
 
     _write_report(records)
     _write_errors(records)
+    _write_queue_audit(records)
     _generate_summary(records)
     _aggregate_by_minute(records)
     _failure_breakdown(records)

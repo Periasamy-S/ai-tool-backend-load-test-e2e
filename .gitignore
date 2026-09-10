@@ -31,3 +31,24 @@ INPUTS.md
 
 # Claude Code local config
 .claude/
+
+# --- TestOps / portability (added 2026-06-03) --------------------------------
+.testops/
+outputs/
+reports/
+logs/
+registry/
+__pycache__/
+*.pyc
+.env
+.env.dev
+.env.test
+.env.prod
+!.env.example
+# locust outputs
+locust.log
+report.html
+stats*.csv
+*_stats.csv
+*_failures.csv
+*_exceptions.csv
